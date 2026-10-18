@@ -54,6 +54,8 @@ Checked on a MacBook Pro M1 Max and a MacBook Air M5. Numbers come from harness 
 [games/](games/). Not supported: Direct3D 12 games (in progress, below), Vulkan, tessellation, anti-cheat (never
 worked around).
 
+Ongoing fork work: [Elite Dangerous support progress](docs/ELITE_DANGEROUS_PROGRESS.md) — SteamVR connection confirmed; game rendering and playability remain unverified.
+
 | Headset | How | Status |
 |---|---|---|
 | **Apple Vision Pro** (M2 or M5) | VeRantyx app: hand tracking + Joy-Con, or bare hands — **no VR controllers needed** | ✅ Checked |
