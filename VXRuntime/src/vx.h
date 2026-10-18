@@ -140,6 +140,8 @@ DWORD    vx_current_tid(void);
 // Last error lives in the TEB like on Windows.
 void  vx_set_last_error(DWORD e);
 DWORD vx_get_last_error(void);
+// Bounded, opt-in network status diagnostics; never reads API arguments. Preserves both error slots.
+void vx_netdiag(const char *api, int64_t result, const void *caller);
 
 // Handles: small table; stdio handles are the pseudo values Windows uses.
 int vx_handle_fd(HANDLE h);            // -1 if not a file handle
@@ -154,6 +156,7 @@ void   vx_set_event(HANDLE event);          // SetEvent for threads that are not
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);
+void vx_control_metadata_start(const char *exe);
 void vx_control_start(const char *path);       // control.c: VXRT_CONTROL, the socket Command Clips talk to
 extern int vx_trace;
 

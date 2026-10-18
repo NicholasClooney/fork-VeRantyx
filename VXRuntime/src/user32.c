@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <ApplicationServices/ApplicationServices.h>
 #include "ui.h"
+#include "renderdiag.h"
 
 #define CW_USEDEFAULT ((int)0x80000000)
 #define HWND_BASE     0x30000
@@ -429,9 +430,18 @@ static WINAPI DWORD MsgWaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL al
 static WINAPI BOOL TranslateMessage(const MSG *m) { return m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN; }   // characters arrive as WM_CHAR already
 typedef void (WINAPI *TIMERPROC)(HANDLE, uint32_t, uint64_t, DWORD);
 static WINAPI LRESULT DispatchMessageA(const MSG *m) {
-    if (m->message == WM_TIMER && m->lparam) { ((TIMERPROC)m->lparam)(m->hwnd, WM_TIMER, m->wparam, tick_ms()); return 0; }
+    if (m->message == WM_TIMER && m->lparam) {
+        vx_renderdiag_activity(RD_CALLBACK_ENTERED);
+        ((TIMERPROC)m->lparam)(m->hwnd, WM_TIMER, m->wparam, tick_ms());
+        vx_renderdiag_activity(RD_CALLBACK_COMPLETED);
+        return 0;
+    }
     vx_window *w = vx_window_get(m->hwnd);
-    return w ? call_proc(w, m->message, m->wparam, m->lparam) : 0;
+    if (!w) return 0;
+    vx_renderdiag_activity(RD_CALLBACK_ENTERED);
+    LRESULT result = call_proc(w, m->message, m->wparam, m->lparam);
+    vx_renderdiag_activity(RD_CALLBACK_COMPLETED);
+    return result;
 }
 static WINAPI LRESULT DispatchMessageW(const MSG *m) { return DispatchMessageA(m); }
 
@@ -1359,19 +1369,19 @@ static WINAPI HANDLE SetThreadDpiAwarenessContext(HANDLE c) { (void)c; return (H
 static WINAPI BOOL IsProcessDPIAware(void) { return 0; }
 
 // ---- message boxes, misc ---------------------------------------------------------------------------------------------------------
-static WINAPI int MessageBoxA(HANDLE owner, const char *text, const char *caption, uint32_t type) {
+static WINAPI int MessageBoxA_impl(HANDLE owner, const char *text, const char *caption, uint32_t type) {
     (void)owner;
     vx_log("MessageBox: %s: %s", caption ? caption : "", text ? text : "");
     return vx_cocoa_message_box(text, caption, type);
 }
-static WINAPI int MessageBoxW(HANDLE owner, const WCHAR *text, const WCHAR *caption, uint32_t type) {
+static WINAPI int MessageBoxW_impl(HANDLE owner, const WCHAR *text, const WCHAR *caption, uint32_t type) {
     char *t = vx_utf8_dup(text), *c = vx_utf8_dup(caption);
-    int r = MessageBoxA(owner, t, c, type);
+    int r = MessageBoxA_impl(owner, t, c, type);
     free(t); free(c);
     return r;
 }
-static WINAPI int MessageBoxExA(HANDLE o, const char *t, const char *c, uint32_t type, uint16_t lang) { (void)lang; return MessageBoxA(o, t, c, type); }
-static WINAPI int MessageBoxExW(HANDLE o, const WCHAR *t, const WCHAR *c, uint32_t type, uint16_t lang) { (void)lang; return MessageBoxW(o, t, c, type); }
+static WINAPI int MessageBoxExA(HANDLE o, const char *t, const char *c, uint32_t type, uint16_t lang) { (void)lang; return MessageBoxA_impl(o, t, c, type); }
+static WINAPI int MessageBoxExW(HANDLE o, const WCHAR *t, const WCHAR *c, uint32_t type, uint16_t lang) { (void)lang; return MessageBoxW_impl(o, t, c, type); }
 static WINAPI BOOL MessageBeep(uint32_t type) { (void)type; vx_cocoa_beep(); return 1; }
 
 static uint16_t g_message_atoms;
@@ -1437,6 +1447,24 @@ static void sb_json_str(sbuf *b, const char *s) {
         else sb_put(b, (const char *)c, 1);
     }
     sb_put(b, "\"", 1);
+}
+// Metadata diagnostics never read window titles, drawn text or application class names.
+char *vx_ui_metadata(void) {
+    unsigned total = 0, visible = 0, enabled = 0, children = 0, minimized = 0;
+    pthread_mutex_lock(&g_win_lock);
+    for (int i = 0; i < g_window_next; ++i) {
+        vx_window *w = g_windows[i];
+        if (!w || w->destroyed) continue;
+        ++total; visible += !!w->visible; enabled += !!w->enabled;
+        children += !!w->parent; minimized += !!w->minimized;
+    }
+    pthread_mutex_unlock(&g_win_lock);
+    sbuf b = { 0 };
+    sb_printf(&b, "{\"schema_version\":1,\"status\":\"ok\",\"pid\":%d,\"total_windows\":%u,"
+              "\"visible_windows\":%u,\"enabled_windows\":%u,\"child_windows\":%u,"
+              "\"minimized_windows\":%u,\"error_category\":\"unknown\"}",
+              (int)getpid(), total, visible, enabled, children, minimized);
+    return b.p;
 }
 char *vx_ui_state(int texts) {
     sbuf b = { 0 };
@@ -1562,6 +1590,18 @@ void vx_ui_type(HANDLE hwnd, const char *utf8) {
     vx_utf8_to_utf16(utf8, strlen(utf8), u, n);
     for (size_t i = 0; i < n; i++) queue_post(w->queue, hwnd, WM_CHAR, u[i], 1);
     free(u);
+}
+
+// Export wrappers keep the original PE caller, including at optimized builds.
+__attribute__((noinline)) static WINAPI int MessageBoxA(HANDLE owner, const char *text, const char *caption, uint32_t type) {
+    const void *caller = VX_RETURN_ADDRESS();
+    vx_netdiag("MessageBoxA", 0, caller);
+    return MessageBoxA_impl(owner, text, caption, type);
+}
+__attribute__((noinline)) static WINAPI int MessageBoxW(HANDLE owner, const WCHAR *text, const WCHAR *caption, uint32_t type) {
+    const void *caller = VX_RETURN_ADDRESS();
+    vx_netdiag("MessageBoxW", 0, caller);
+    return MessageBoxW_impl(owner, text, caption, type);
 }
 
 static const vx_export user32[] = {

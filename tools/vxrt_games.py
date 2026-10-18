@@ -61,10 +61,28 @@ def problems(profile, filename=None):
         out.append(f"the file should be named {profile['appid']}.json")
     if profile["default_scenario"] not in profile["scenarios"]:
         out.append(f"default_scenario {profile['default_scenario']!r} is not in scenarios")
+    relative = profile.get("exe")
+    if relative is not None and (not relative or os.path.isabs(relative) or
+                                 ".." in relative.replace("\\", "/").split("/") or
+                                 re.match(r"^[A-Za-z]:", relative)):
+        out.append("exe must be a nonempty relative path inside the install folder")
     for name in profile["baselines"]:
         if name.split("@")[0] not in profile["scenarios"]:
             out.append(f"baseline {name!r}: no scenario {name.split('@')[0]!r}")
     return out
+
+def executable(profile, folder):
+    """Resolve an explicit profile executable inside its install, never a guessed fallback."""
+    relative = profile.get("exe")
+    if not relative:
+        return None
+    if os.path.isabs(relative) or re.match(r"^[A-Za-z]:", relative) or ".." in relative.replace("\\", "/").split("/"):
+        raise ValueError("profile exe must be relative to its install folder")
+    root = os.path.realpath(folder)
+    path = os.path.realpath(os.path.join(root, relative))
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("profile exe escapes its install folder")
+    return path if os.path.isfile(path) else None
 
 def load_all():
     """{app id: profile} of every valid profile; invalid ones are left out (check reports them)."""

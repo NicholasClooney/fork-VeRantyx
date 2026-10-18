@@ -576,6 +576,7 @@ static WINAPI BOOL SHGetSpecialFolderPathA(void *wnd, char *out, int csidl, BOOL
 static WINAPI DWORD NtQuerySystemInformation(int cls, void *out, DWORD size, DWORD *ret) { (void)cls; (void)out; (void)size; if (ret) *ret = 0; return STATUS_NOT_IMPLEMENTED; }
 static WINAPI DWORD NtQueryInformationProcess(HANDLE p, int cls, void *out, DWORD size, DWORD *ret) { (void)p; (void)cls; (void)out; (void)size; if (ret) *ret = 0; return STATUS_NOT_IMPLEMENTED; }
 static WINAPI DWORD NtQueryInformationThread(HANDLE t, int cls, void *out, DWORD size, DWORD *ret) { (void)t; (void)cls; (void)out; (void)size; if (ret) *ret = 0; return STATUS_NOT_IMPLEMENTED; }
+static WINAPI DWORD NtSetInformationThread(HANDLE t, int cls, void *info, DWORD size) { (void)t; (void)cls; (void)info; (void)size; return STATUS_NOT_IMPLEMENTED; }
 int vx_reg_close(void *hkey);
 static WINAPI DWORD NtClose(HANDLE h) {
     if (vx_reg_close(h)) return 0;
@@ -665,6 +666,7 @@ static const vx_export shell[] = {
     VX_EXPORT(SHGetFolderPathW), VX_EXPORT(SHGetFolderPathA), VX_EXPORT(SHGetKnownFolderPath), VX_EXPORT(SHGetSpecialFolderPathW), VX_EXPORT(SHGetSpecialFolderPathA),
 };
 static const vx_export ntdll[] = {
+    VX_EXPORT(NtSetInformationThread),
     VX_EXPORT(NtQuerySystemInformation), VX_EXPORT(NtQueryInformationProcess), VX_EXPORT(NtQueryInformationThread),
     VX_EXPORT(NtClose), VX_EXPORT(RtlInitUnicodeString), VX_EXPORT(RtlFreeUnicodeString), VX_EXPORT(RtlFreeHeap), VX_EXPORT(RtlAllocateHeap), VX_EXPORT(LdrLockLoaderLock),
     VX_EXPORT(LdrUnlockLoaderLock), VX_EXPORT(NtAllocateVirtualMemory), VX_EXPORT(NtQueryVirtualMemory),

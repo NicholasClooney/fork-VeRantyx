@@ -16,6 +16,7 @@ it starts, with a typed reason (the user is playing, SteamVR is up, the roots ar
 
 Exit status: 0 pass, 1 fail, 2 no baseline to compare with, 3 refused, 4 error.
 """
+import socket, stat, tempfile
 import argparse, json, math, mmap, os, re, shutil, signal, statistics, struct, subprocess, sys, threading, time, zlib
 from datetime import datetime, timezone
 
@@ -33,6 +34,22 @@ TUNABLES = {"VXRT_VR_RENDER_SCALE", "VERANTYX_DISPLAY_SCALE", "VERANTYX_DISPLAY_
             "VERANTYX_BITRATE_MBPS", "VERANTYX_HEVC_QUALITY", "VXRT_MSAA_MAX", "VXRT_MAX_ANISOTROPY", "VXRT_VR_SETTINGS",
             "VERANTYX_DECOUPLED_POSES", "VXRT_GPU_PROFILE", "VXRT_STATS", "VXRT_TRACE_CALLS"}
 
+# Separate from tunables: these values can only restrict diagnostic networking/audio.
+SAFETY_ENV = {"VERANTYX_LOOPBACK_ONLY": "1", "VERANTYX_AUDIO": "0", "VERANTYX_ALVR": "0", "VXRT_MUTE": "1"}
+
+def safety_environment(values):
+    values = dict(values or {})
+    bad = [k for k, v in values.items() if k not in SAFETY_ENV or v != SAFETY_ENV[k]]
+    if bad:
+        raise ValueError("unsupported safety environment setting: " + ", ".join(sorted(bad)))
+    return values
+
+def network_diagnostic_config(enabled):
+    if type(enabled) is not bool:
+        raise ValueError("network_diagnostic must be a boolean")
+    return {"enabled": enabled, "environment": {"VXRT_NET_DIAG": "1"} if enabled else {},
+            "max_records_per_process": 128 if enabled else 0}
+
 # Games the harness knows (games/<app id>.json, by key): how they start, the scenarios, the baselines. Other installed
 # games are run with a default profile (the generic launcher, scenario "start").
 def profiles():
@@ -48,7 +65,11 @@ def resolve(game):
     inst = installed()
     p = profiles_db.by_key(str(game))
     if p:
-        return p["key"], p, inst.get(p["appid"])
+        game_install = inst.get(p["appid"])
+        if game_install and "exe" in p:
+            path = profiles_db.executable(p, game_install["folder"])
+            game_install = dict(game_install, exe=path) if path else None
+        return p["key"], p, game_install
     if game in inst:
         return game, profiles_db.default_profile(game, inst[game]["name"]), inst[game]
     return game, None, None
@@ -82,7 +103,7 @@ def preconditions(spec, game, args, root, overlay, need_steam=True):
 SLOT = 88 + 4096 * 4096 * 8                                     # one frame slot of the shared file (driver_verantyx.cpp)
 HANDS = 64 + 2 * SLOT                                           # struct SharedHands, after the two slots
 
-def feed_pose(path, stop, press_every):
+def feed_pose(path, stop, press_every, controllers=True):
     """A slowly turning head and two hands, tracked, written into the VeRantyx shared frame file as the Mac encoder
     does with the Vision Pro's tracking; the right trigger is pulled for half a second every press_every seconds
     (SteamVR gives a game scene focus only after input)."""
@@ -101,8 +122,11 @@ def feed_pose(path, stop, press_every):
             struct.pack_into("<16f", m, HANDS, math.cos(a), 0, -math.sin(a), 0, 0, 1, 0, 0, math.sin(a), 0, math.cos(a), 0, 0.02 * math.sin(t), 1.6, 0, 1)
             struct.pack_into("<16f", m, HANDS + 64, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -0.2, 1.2, -0.4, 1)
             struct.pack_into("<16f", m, HANDS + 128, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.2, 1.2, -0.4, 1)
-            m[HANDS + 192] = 1; m[HANDS + 193] = 1
-            pressing = press_every > 0 and t - start > press_every and (t - start) % press_every < 0.5
+            m[HANDS + 192] = int(controllers); m[HANDS + 193] = int(controllers)
+            pressing = controllers and press_every > 0 and t - start > press_every and (t - start) % press_every < 0.5
+            if not controllers:
+                # Clear stale hand buttons/axes from prior runs as well as tracking flags.
+                m[HANDS + 194:HANDS + 244] = bytes(50)
             m[HANDS + 195] = 255 if pressing else 0
             struct.pack_into("<d", m, HANDS + 244, time.monotonic())
             m[HANDS + 286] = 1
@@ -186,6 +210,14 @@ def sample_gpu(stop, samples):
         stop.wait(2)
 
 # ---- reading what happened --------------------------------------------------------------------------------------------
+def encoder_drop_delta(samples, window_s):
+    if len(samples) < 2:
+        return None
+    # Early exits can leave fewer samples than the requested measurement window.
+    count = min(len(samples), max(2, int(window_s / 5)))
+    return samples[-1] - samples[-count]
+
+
 def encoder_fps(path):
     if not os.path.exists(path):
         return []
@@ -272,6 +304,8 @@ def game_log_facts(path, exe):
         elif re.match(r"[A-Za-z_][\w.]*Exception: ", line):
             facts["managed_exceptions"] += 1
             if facts["managed_exceptions"] == 1: problem = line
+        elif re.search(r"MessageBox: Network error: Unable to initialise network\. Please check your connection\.$", line.rstrip()):
+            problem = line
         m = re.search(r"(ExitProcess\(\d+\) from \S+)", line)
         if m: facts["exit"] = m.group(1)
         if problem and not facts["first_problem"]:
@@ -396,11 +430,204 @@ def git_state():
     dirty = bool(subprocess.run(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True).stdout.strip())
     return head, dirty
 
+# Restricted diagnostics use a new protocol, never the text/action Clip client.
+def control_environment(env):
+    return {k: v for k, v in env.items() if not k.startswith("VXRT_CONTROL")}
+
+RENDER_APIS = ("D3D11CreateDevice", "D3D11CreateDeviceAndSwapChain", "IDXGIFactory.CreateSwapChain",
+               "IDXGIFactory2.CreateSwapChainForHwnd", "IDXGISwapChain.Present", "IDXGISwapChain1.Present1")
+RENDER_STAGES = ("present_test", "present_no_drawable", "present_drawable_committed", "d3d12_delegate")
+
+RENDER_ACTIVITY = ("work_commit_main", "work_commit_pre", "window_callback_entered", "window_callback_completed")
+
+def validate_render_counters(value):
+    if (not isinstance(value, dict) or value.get("scope") != "selected_process_including_loaded_dlls"
+        or value.get("openvr_submit") != "not_instrumented" or type(value.get("overflow")) is not bool
+        or not isinstance(value.get("apis"), list) or len(value["apis"]) != len(RENDER_APIS)):
+        return None
+    integer = lambda n: type(n) is int and 0 <= n <= 0xffffffffffffffff
+    if any(not integer(value.get(k)) for k in RENDER_STAGES + RENDER_ACTIVITY):
+        return None
+    valid, cpu = value.get("process_cpu_valid"), value.get("process_cpu_ns")
+    if type(valid) is not bool or (valid and not integer(cpu)) or (not valid and cpu is not None):
+        return None
+    apis = []
+    for api, row in zip(RENDER_APIS, value["apis"]):
+        if not isinstance(row, dict) or row.get("api") != api:
+            return None
+        keys = ("entered", "completed", "success", "failure")
+        if any(not integer(row.get(k)) for k in keys):
+            return None
+        hr = row.get("last_hresult")
+        if hr is not None and (type(hr) is not int or not 0 <= hr <= 0xffffffff):
+            return None
+        apis.append(dict(api=api, last_hresult=hr, **{k: row[k] for k in keys}))
+    return dict(scope=value["scope"], openvr_submit="not_instrumented", overflow=value["overflow"],
+                apis=apis, process_cpu_valid=valid, process_cpu_ns=cpu,
+                **{k: value[k] for k in RENDER_STAGES + RENDER_ACTIVITY})
+
+class WindowMetadata:
+    schedule = (30, 40, 50)
+
+    def __init__(self, enabled, render=False):
+        if type(render) is not bool:
+            raise ValueError("render_diagnostic must be a boolean")
+        self.window_enabled, self.render_enabled = enabled, render
+        self.enabled = enabled or render
+        if type(enabled) is not bool:
+            raise ValueError("window_metadata must be a boolean")
+        self.config = {"enabled": enabled, "mode": "metadata_only" if enabled else "off",
+                       "read_only": True, "text_capture": False, "max_samples": 3 if enabled else 0,
+                       "schedule_seconds": list(self.schedule) if enabled else [],
+                       "target_selector": "exact_realpath_main_process", "child_excluded": True,
+                       "request_count": 0, "success_count": 0, "status": "not_started" if enabled else "off"}
+        self.render_config = dict(self.config, enabled=render, mode="render_counters" if render else "off",
+                                  max_samples=3 if render else 0, schedule_seconds=list(self.schedule) if render else [],
+                                  scope="selected_process_including_loaded_dlls", openvr_submit="not_instrumented",
+                                  status="not_started" if render else "off")
+        self.directory = self.path = None
+        self.socket_identity = self.directory_identity = None
+        self.rows = []
+
+    def prepare(self, env, target):
+        if not self.enabled:
+            return
+        self.directory = tempfile.mkdtemp(prefix="vxclip-", dir="/private/tmp")
+        self.path = os.path.join(self.directory, "control.sock")
+        st = os.lstat(self.directory)
+        self.directory_identity = (st.st_dev, st.st_ino)
+        mode = "metadata_render" if self.window_enabled and self.render_enabled else "render" if self.render_enabled else "metadata"
+        env.update(VXRT_CONTROL_DIAG=mode, VXRT_CONTROL_TARGET=os.path.realpath(target),
+                   VXRT_CONTROL_DIAG_SOCKET=self.path)
+        for config in (self.config, self.render_config):
+            if config["enabled"]:
+                config["status"] = "prepared"
+
+    def owns_directory(self):
+        try:
+            st = os.lstat(self.directory)
+            return (stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == self.directory_identity
+                    and os.path.realpath(self.directory) == self.directory)
+        except (OSError, TypeError):
+            return False
+
+    def remember_socket(self):
+        if self.socket_identity is not None or not self.path or not self.owns_directory():
+            return
+        try:
+            st = os.lstat(self.path)
+            if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+                self.socket_identity = (st.st_dev, st.st_ino)
+        except OSError:
+            pass
+
+    def sample(self):
+        # Never persist arbitrary server fields, even when a stale/malicious endpoint replies.
+        counts = ("total_windows", "visible_windows", "enabled_windows", "child_windows", "minimized_windows")
+        deadline = time.monotonic() + 2
+        if not self.owns_directory():
+            return {"status": "identity_mismatch"}
+        try:
+            st = os.lstat(self.path)
+            if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+                return {"status": "unavailable"}
+            identity = (st.st_dev, st.st_ino)
+            if self.socket_identity is not None and identity != self.socket_identity:
+                return {"status": "identity_mismatch"}
+            self.socket_identity = identity
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(max(.001, deadline - time.monotonic()))
+                client.connect(self.path)
+                client.sendall(b"metadata\n")
+                data = b""
+                while b"\n" not in data:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError()
+                    client.settimeout(remaining)
+                    chunk = client.recv(4096 - len(data))
+                    if not chunk or len(data) + len(chunk) >= 4096:
+                        return {"status": "invalid_response"}
+                    data += chunk
+                value = json.loads(data.split(b"\n", 1)[0])
+                if (not isinstance(value, dict) or value.get("status") != "ok" or value.get("schema_version") != 1
+                    or type(value.get("pid")) is not int or value["pid"] <= 0
+                    or (self.window_enabled and any(type(value.get(k)) is not int or not 0 <= value[k] <= 16384 for k in counts))):
+                    return {"status": "invalid_response"}
+                row = {"status": "ok", "pid": value["pid"]}
+                if self.window_enabled:
+                    row.update(error_category="unknown", **{k: value[k] for k in counts})
+                if self.render_enabled:
+                    render = validate_render_counters(value.get("render"))
+                    if render is None:
+                        return {"status": "invalid_response"}
+                    row["render"] = render
+                return row
+        except (TimeoutError, socket.timeout):
+            return {"status": "timeout"}
+        except (OSError, ValueError, TypeError):
+            return {"status": "unavailable"}
+
+    def collect(self, stop, started):
+        for index, offset in enumerate(self.schedule, 1):
+            while time.monotonic() < started + offset and not stop.is_set():
+                self.remember_socket()  # identity only; no extra state requests
+                stop.wait(min(.1, max(0, started + offset - time.monotonic())))
+            self.remember_socket()
+            if stop.is_set():
+                break
+            row = self.sample()
+            row.update(sample_index=index, elapsed_seconds=round(time.monotonic() - started, 3))
+            self.rows.append(row)
+        for config in (self.config, self.render_config):
+            if config["enabled"]:
+                config.update(request_count=len(self.rows), success_count=sum(r["status"] == "ok" for r in self.rows),
+                              status="completed" if len(self.rows) == 3 else "stopped")
+
+    def cleanup(self):
+        # No recursive removal: an unexpected replacement is left alone.
+        if self.path and self.owns_directory():
+            try:
+                st = os.lstat(self.path)
+                if stat.S_ISSOCK(st.st_mode) and (st.st_dev, st.st_ino) == self.socket_identity:
+                    # Only remove the endpoint this sampler actually observed.
+                    os.unlink(self.path)
+            except OSError:
+                pass
+        if self.directory:
+            try:
+                st = os.lstat(self.directory)
+                if (st.st_dev, st.st_ino) == self.directory_identity and stat.S_ISDIR(st.st_mode):
+                    os.rmdir(self.directory)
+            except OSError:
+                pass
+
+    def seal(self, run_dir, evidence):
+        for config, metric in ((self.config, "window_metadata"), (self.render_config, "render_diagnostic")):
+            if not config["enabled"]:
+                continue
+            if metric == "window_metadata":
+                rows = [{k: v for k, v in row.items() if k != "render"} for row in self.rows]
+            else:
+                rows = [{k: v for k, v in row.items() if k in ("status", "pid", "sample_index", "elapsed_seconds", "render")} for row in self.rows]
+            path = os.path.join(run_dir, metric + ".jsonl")
+            with open(path, "w") as output:
+                for row in rows:
+                    output.write(json.dumps(row, sort_keys=True) + "\n")
+            evidence.observe(metric, rows, path, note="fixed read-only diagnostic; not application frame or authentication evidence")
+            config["artifact"] = rel(path)
+
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
-        trace=False, need_steam=True, quiet=False, settings=None, stream=False):
+        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False):
+    windows = WindowMetadata(window_metadata, render_diagnostic)
+    diagnostic = network_diagnostic_config(network_diagnostic)
+    safety_env = safety_environment(safety_env)
     key, spec, inst = resolve(game)
     scenario = scenario or (spec or {}).get("default_scenario", "start")
     sc = (spec or {}).get("scenarios", {}).get(scenario)
+    input_mode = (sc or {}).get("input", "simulated_controllers")
+    if input_mode == "keyboard_mouse":
+        press_every = 0
     args = list((sc or {}).get("args", [])) + list(extra_args)
     seconds = seconds or (sc or {}).get("seconds", 150)
     root = root or os.path.join(HARNESS, "root")
@@ -415,12 +642,17 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
               "arguments": args, "seconds": seconds, "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
               "environment": {"commit": head, "uncommitted_changes": dirty, "root": root, "overlay": overlay,
                               "machine": doctor.machine_info(), "python": sys.version.split()[0],
-                              # (settings already in the environment reach the game too: recorded, so a result says what ran)
-                              "inherited": {k: v for k, v in os.environ.items() if k.startswith(("VXRT_", "VERANTYX_"))}}}
+                              # Parent snapshot; network_diagnostic below replaces inherited VXRT_NET_DIAG.
+                              "inherited": {k: v for k, v in control_environment(os.environ).items() if k.startswith(("VXRT_", "VERANTYX_"))}}}
     say = (lambda *a: None) if quiet else (lambda *a: print(*a, file=sys.stderr))
 
     settings = dict((spec or {}).get("settings", {}), **(settings or {}))      # (the profile's defaults, then the run's)
     result["settings"] = settings
+    result["network_diagnostic"] = diagnostic
+    result["window_diagnostic"] = windows.config
+    result["render_diagnostic"] = windows.render_config
+    result["input_mode"] = input_mode
+    result["safety_environment"] = dict({"VXRT_MUTE": "1", "VERANTYX_AUDIO": "0"}, **safety_env)
     checks = preconditions(spec, inst, args, root, overlay, need_steam)
     bad = sorted(set(settings) - TUNABLES)
     checks.append({"code": "settings_allowed", "ok": not bad, "detail": "only AGENTS.md's tunables" if not bad else "not tunable: " + ", ".join(bad)})
@@ -439,11 +671,15 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         result["preconditions"].append({"code": "vxrt_builds", "ok": False, "detail": "make failed: logs/build.log"})
         return finish(result, run_dir, say)
 
-    env = dict(os.environ, VXRT_VR_ROOT=root, VXRT_VR_OVERLAY=overlay, VXRT_VR_LOG_DIR=logs, VXRT_MUTE="1", VERANTYX_AUDIO="0")
+    env = dict(control_environment(os.environ), VXRT_VR_ROOT=root, VXRT_VR_OVERLAY=overlay, VXRT_VR_LOG_DIR=logs, VXRT_MUTE="1", VERANTYX_AUDIO="0")
+    # Only the explicit fixed diagnostic option may enable this runtime logging.
+    env.pop("VXRT_NET_DIAG", None)
+    env.update(diagnostic["environment"])
     if quality: env["VXRT_VR_QUALITY"] = quality
     else: env.pop("VXRT_VR_QUALITY", None)
     if trace: env["VXRT_TRACE"] = "1"
     env.update({k: str(v) for k, v in settings.items()})
+    env.update(result["safety_environment"])
     if spec["launcher"] == "alyx":
         cmd = [os.path.join(REPO, "scripts", "launch_vxrt_alyx.sh")] + args
         game_log = os.path.join(logs, "vxrt-alyx.log"); exe = "hlvr.exe"
@@ -452,15 +688,24 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         exe = os.path.basename(inst["exe"]); game_log = os.path.join(logs, "vxrt-%s.log" % os.path.splitext(exe)[0])
     result["command"] = " ".join(cmd)
     result["exe"] = exe
+    windows.prepare(env, inst["exe"])
     shared = os.path.join(root, "drive_c", "vr_shared_frame.dat")
     stop, gpu, streamed = threading.Event(), [], []
-    threads = [threading.Thread(target=feed_pose, args=(shared, stop, press_every), daemon=True),
+    threads = [threading.Thread(target=feed_pose, args=(shared, stop, press_every, input_mode != "keyboard_mouse"), daemon=True),
                threading.Thread(target=sample_gpu, args=(stop, gpu), daemon=True)]
     if stream:
         threads.append(threading.Thread(target=stream_client, args=(stop, streamed, os.path.join(run_dir, "stream.hevc")), daemon=True))
+    metadata_thread = None
+    if windows.enabled:
+        metadata_thread = threading.Thread(target=windows.collect, args=(stop, time.monotonic()), daemon=True)
+        threads.append(metadata_thread)
     say(f"vxrt run {run_id}: {result['command']} for {seconds} s")
-    with open(os.path.join(logs, "launcher.log"), "w") as out:
-        p = subprocess.Popen(cmd, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        with open(os.path.join(logs, "launcher.log"), "w") as out:
+            p = subprocess.Popen(cmd, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    except BaseException:
+        windows.cleanup()
+        raise
     for t in threads: t.start()
     exited_at = None
     try:
@@ -473,6 +718,9 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         proxy = proxy_lines(os.path.join(root, "drive_c"), started)
     finally:
         stop.set()
+        if metadata_thread:
+            metadata_thread.join()  # bounded socket deadline; no writer survives evidence sealing
+        windows.cleanup()
         try:
             os.killpg(p.pid, signal.SIGTERM)                  # the launcher's cleanup stops the game and SteamVR
             p.wait(30)
@@ -522,7 +770,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         ev.observe("streamed_sequence_skips", sum(1 for a, b in zip(recent, recent[1:]) if b[1] != a[1] + 1), frames_csv,
                    note="frames the encoder numbered but the stand-in did not get complete")
         drops = [int(x) for x in re.findall(r"encoderDrops=(\d+)", open(os.path.join(logs, "hardware-encoder.log"), errors="replace").read())]
-        ev.observe("encoder_drops_in_window", drops[-1] - drops[-max(2, int(window / 5))] if len(drops) > 1 else None,
+        ev.observe("encoder_drops_in_window", encoder_drop_delta(drops, window),
                    os.path.join(logs, "hardware-encoder.log"), note="captured frames the encoder had no room for")
     ev.observe("gpu_utilization_median", median([v for t, v in gpu if t >= ended - window - 5]), gpu_csv, window_s=window)
     if frame:
@@ -541,6 +789,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     ev.observe("managed_exceptions", facts["managed_exceptions"], game_log)
     ev.observe("first_problem", facts["first_problem"], game_log)
     ev.observe("exit", facts["exit"], game_log)
+    windows.seal(run_dir, ev)  # appended: existing observation IDs retain their positions
 
     base_name, base, base_src = baseline_for(key, scenario, quality)
     result["baseline"] = base_src
@@ -551,7 +800,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         {"item": "frame-to-frame timing (stutter)", "reason": "fps are 5-second averages"},
         {"item": "whether the picture is right", "reason": "only checked for not being black; look at frame_end.png"},
         {"item": "audio", "reason": "the game is muted (VXRT_MUTE=1)"},
-        {"item": "behaviour with a real headset and hands", "reason": "the head pose and the hands are simulated; the right trigger is pulled every %g s" % press_every},
+        {"item": "behaviour with a real headset and hands", "reason": ("head pose only is simulated; no simulated controllers; physical keyboard/mouse and AVP are untested" if input_mode == "keyboard_mouse" else "the head pose and the hands are simulated; the right trigger is pulled every %g s" % press_every)},
         {"item": "whether the game reacts to the controllers and can be played", "reason": "bindings loading is all a run sees: a person decides 'playable' (tools/vxrt_playtest.py)"},
         {"item": "run-to-run variation", "reason": "one run; compare settings in alternating runs (A B B A)"},
     ]
@@ -601,7 +850,11 @@ def main():
     ap.add_argument("--press-every", type=float, default=15.0, help="pull the right trigger every N seconds (0: never)")
     ap.add_argument("--root"); ap.add_argument("--overlay")
     ap.add_argument("--trace", action="store_true", help="VXRT_TRACE=1 (slower: more in the log)")
+    ap.add_argument("--render-diagnostic", action="store_true", help="three fixed D3D11/DXGI counter snapshots in the selected main process; no textures or OpenVR hooks")
+    ap.add_argument("--window-metadata", action="store_true", help="three read-only window metadata samples; no text or input")
+    ap.add_argument("--network-diagnostic", action="store_true", help="fixed network API diagnostic: returns/errors and caller offsets, at most 128 records per process, no argument payloads")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="a tunable setting (AGENTS.md), repeatable")
+    ap.add_argument("--safety-env", action="append", default=[], metavar="NAME=VALUE", help="restrict diagnostic networking/audio (fixed safe values only), repeatable")
     ap.add_argument("--no-steam", action="store_true", help="do not require Mac Steam (games that do not use it)")
     ap.add_argument("--stream", action="store_true", help="also receive the video stream as a stand-in headset and measure it")
     ap.add_argument("--json", action="store_true", help="the result on stdout")
@@ -630,7 +883,8 @@ def main():
             for name in spec["baselines"]:
                 scenario, _, quality = name.partition("@")
                 r = run(key, scenario, quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam,
-                        settings=dict(kv.split("=", 1) for kv in a.set))
+                        settings=dict(kv.split("=", 1) for kv in a.set), safety_env=dict(kv.split("=", 1) for kv in a.safety_env),
+                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic)
                 code = {"pass": 0, "fail": 1, "no_baseline": 2, "refused": 3}.get(r["status"], 4)
                 if code == 3: sys.exit(3)                      # (refused: the rest would be too)
                 worst = max(worst, code)
@@ -644,7 +898,8 @@ def main():
         print(json.dumps(checks, ensure_ascii=False, indent=2)); sys.exit(0 if all(c["ok"] for c in checks) else 3)
     try:
         r = run(a.game, a.scenario, a.quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam, quiet=a.json,
-                settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream)
+                settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream,
+                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic)
     except Exception as e:                                    # (an error in the harness itself, not a game's)
         print(f"vxrt run: error: {e}", file=sys.stderr); sys.exit(4)
     if a.json:

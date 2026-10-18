@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vxrt_games as profiles_db
 import vxrt_doctor as doctor                                    # noqa: E402
 
 REPO = doctor.REPO
@@ -38,8 +39,15 @@ def windows_to_mac(path):
 
 def libraries():
     libs = [VXRT_STEAM] + ([STEAM_ROOT] if os.environ.get("VXRT_NO_WINE") != "1" and os.path.isdir(STEAM_ROOT) else [])
+    # Explicit local library discovery does not import files or change Steam configuration.
+    local = os.environ.get("VXRT_STEAM_LIBRARY")
+    if local:
+        local = os.path.realpath(os.path.expanduser(local))
+        if not os.path.isdir(os.path.join(local, "steamapps")):
+            raise ValueError("VXRT_STEAM_LIBRARY must name a local library containing steamapps")
+        libs.insert(0, local)
     vdf = os.path.join(STEAM_ROOT, "steamapps", "libraryfolders.vdf")
-    if os.path.exists(vdf):
+    if os.environ.get("VXRT_NO_WINE") != "1" and os.path.exists(vdf):
         for m in re.finditer(r'"path"\s+"([^"]+)"', open(vdf, errors="replace").read()):
             p = windows_to_mac(m.group(1))
             if p and os.path.isdir(p) and os.path.realpath(p).lower() not in {os.path.realpath(x).lower() for x in libs}:
@@ -55,6 +63,7 @@ def manifest(path):
 _scan_cache = {}
 def find_games():
     games, seen = [], set()
+    profiles = profiles_db.load_all()
     for lib in libraries():
         for acf in sorted(glob.glob(os.path.join(lib, "steamapps", "appmanifest_*.acf"))):
             m = manifest(acf)
@@ -72,6 +81,9 @@ def find_games():
                 exes, _, markers = doctor.scan_game(folder)
                 _scan_cache[key] = (doctor.pick_exe(exes, m["name"] or m["installdir"]), sorted(markers))
             exe, markers = _scan_cache[key]
+            profile = profiles.get(m["appid"], {})
+            if "exe" in profile:
+                exe = profiles_db.executable(profile, folder)
             if not exe:
                 continue
             seen.add(m["appid"])

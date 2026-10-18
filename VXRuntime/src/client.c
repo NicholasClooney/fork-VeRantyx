@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "vx.h"
+#include "iphlp.h"
 
 // ---- kernel32 -------------------------------------------------------------------------------------------------------------------
 static WINAPI BOOL GetProductInfo(DWORD major, DWORD minor, DWORD sp_major, DWORD sp_minor, DWORD *type) {
@@ -149,6 +150,11 @@ static WINAPI BOOL GetVolumePathNameW(const WCHAR *path, WCHAR *out, DWORD cap) 
     char drive[4] = "C:\\";
     if (path && path[0] && path[1] == ':') drive[0] = (char)path[0];
     return vx_return_string_w(drive, out, cap) < cap;
+}
+static WINAPI BOOL GetVolumeNameForVolumeMountPointA(const char *mount, char *out, DWORD cap) {
+    (void)mount; (void)out; (void)cap;
+    vx_set_last_error(1);                                          // ERROR_INVALID_FUNCTION: no volume GUIDs here
+    return 0;
 }
 static WINAPI BOOL GetVolumeNameForVolumeMountPointW(const WCHAR *mount, WCHAR *out, DWORD cap) {
     (void)mount; (void)out; (void)cap;
@@ -363,6 +369,11 @@ static WINAPI void HidD_GetHidGuid(uint8_t *guid) {
 static WINAPI BOOL hid_fails(void) { vx_set_last_error(1); return 0; }
 static WINAPI LONG hidp_fails(void) { return (LONG)0xC0110001; }  // HIDP_STATUS_INVALID_PREPARSED_DATA
 static WINAPI DWORD iphlp_unsupported(void) { return 50; }       // ERROR_NOT_SUPPORTED
+__attribute__((noinline)) static WINAPI DWORD GetBestRoute(DWORD destination, DWORD source, void *route) {
+    (void)destination; (void)source; (void)route;
+    vx_netdiag("GetBestRoute", 50, VX_RETURN_ADDRESS());
+    return 50;                                                // ERROR_NOT_SUPPORTED: no routing-table query yet.
+}
 
 // ---- crypt32 extras: base64 and the rest refused ----------------------------------------------------------------------------------
 static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -496,7 +507,39 @@ static WINAPI HANDLE SetupDiOpenDevRegKey(HANDLE set, void *data, DWORD scope, D
     return (HANDLE)(intptr_t)-1;
 }
 static WINAPI DWORD CM_Locate_DevNodeA(DWORD *node, const char *id, DWORD flags) { (void)id; (void)flags; if (node) *node = 0; return 0x0D; }
-static WINAPI DWORD iphlp_not_found(void) { return 2; }          // ERROR_FILE_NOT_FOUND: no such interface
+__attribute__((noinline)) static WINAPI DWORD GetAdaptersAddresses(DWORD family, DWORD flags, void *reserved, void *addresses, DWORD *size) {
+    DWORD result = vx_get_adapters_addresses(family, flags, reserved, addresses, size);
+    vx_netdiag("GetAdaptersAddresses", result, VX_RETURN_ADDRESS());
+    return result;
+}
+__attribute__((noinline)) static WINAPI DWORD GetAdaptersInfo(void *info, DWORD *size) {
+    vx_netdiag("GetAdaptersInfo", 50, VX_RETURN_ADDRESS());
+    return 50;
+}
+__attribute__((noinline)) static WINAPI DWORD GetBestInterface(DWORD destination, DWORD *index) {
+    vx_netdiag("GetBestInterface", 50, VX_RETURN_ADDRESS());
+    return 50;
+}
+__attribute__((noinline)) static WINAPI DWORD GetIfTable(void *table, DWORD *size, BOOL order) {
+    vx_netdiag("GetIfTable", 50, VX_RETURN_ADDRESS());
+    return 50;
+}
+__attribute__((noinline)) static WINAPI DWORD GetIpAddrTable(void *table, DWORD *size, BOOL order) {
+    vx_netdiag("GetIpAddrTable", 50, VX_RETURN_ADDRESS());
+    return 50;
+}
+__attribute__((noinline)) static WINAPI DWORD GetNetworkParams(void *info, DWORD *size) {
+    vx_netdiag("GetNetworkParams", 50, VX_RETURN_ADDRESS());
+    return 50;
+}
+__attribute__((noinline)) static WINAPI DWORD ConvertInterfaceGuidToLuid(const void *guid, void *luid) {
+    vx_netdiag("ConvertInterfaceGuidToLuid", 2, VX_RETURN_ADDRESS());
+    return 2;
+}
+__attribute__((noinline)) static WINAPI DWORD GetIfEntry2(void *row) {
+    vx_netdiag("GetIfEntry2", 2, VX_RETURN_ADDRESS());
+    return 2;
+}
 static WINAPI DWORD mixer_none(void) { return 2; }               // MMSYSERR_BADDEVICEID: no mixer devices
 static WINAPI LONG usp_fails(void) { return (LONG)0x80004005; }  // E_FAIL: callers fall back to plain GDI text
 static WINAPI LONG ScriptFreeCache(void **cache) { if (cache) *cache = NULL; return 0; }
@@ -587,7 +630,7 @@ static const vx_export k32[] = {
     VX_EXPORT(GetProductInfo), VX_EXPORT(ProcessIdToSessionId), VX_EXPORT(WTSGetActiveConsoleSessionId), VX_EXPORT(ReadConsoleA),
     { "K32GetModuleFileNameExW", (void *)GetModuleFileNameExW }, { "K32GetModuleFileNameExA", (void *)GetModuleFileNameExA },
     VX_EXPORT(SetProcessShutdownParameters), VX_EXPORT(SetThreadErrorMode), VX_EXPORT(IsWow64Process), VX_EXPORT(GetBinaryTypeW),
-    VX_EXPORT(GetVolumeInformationA), VX_EXPORT(GetVolumePathNameW), VX_EXPORT(GetVolumeNameForVolumeMountPointW),
+    VX_EXPORT(GetVolumeInformationA), VX_EXPORT(GetVolumePathNameW), VX_EXPORT(GetVolumeNameForVolumeMountPointA), VX_EXPORT(GetVolumeNameForVolumeMountPointW),
     VX_EXPORT(GetPrivateProfileStringA), VX_EXPORT(FoldStringW), VX_EXPORT(EnumResourceNamesW),
     { "DebugActiveProcess", (void *)no_debugging }, { "DebugActiveProcessStop", (void *)no_debugging }, VX_EXPORT(GenerateConsoleCtrlEvent),
     { "K32EnumProcessModules", (void *)EnumProcessModules }, { "K32EnumProcessModulesEx", (void *)EnumProcessModulesEx },
@@ -655,11 +698,12 @@ static const vx_export hid[] = {
     { "HidP_GetUsageValue", (void *)hidp_fails }, { "HidP_GetScaledUsageValue", (void *)hidp_fails },
 };
 static const vx_export iphlpapi[] = {
+    VX_EXPORT(GetBestRoute),
     { "GetExtendedTcpTable", (void *)iphlp_unsupported }, { "GetExtendedUdpTable", (void *)iphlp_unsupported },
-    { "GetAdaptersAddresses", (void *)iphlp_unsupported }, { "GetAdaptersInfo", (void *)iphlp_unsupported },
-    { "GetBestInterface", (void *)iphlp_unsupported }, { "GetIfTable", (void *)iphlp_unsupported }, { "GetIpAddrTable", (void *)iphlp_unsupported },
-    { "NotifyAddrChange", (void *)iphlp_unsupported }, { "GetNetworkParams", (void *)iphlp_unsupported },
-    { "ConvertInterfaceGuidToLuid", (void *)iphlp_not_found }, { "GetIfEntry2", (void *)iphlp_not_found },
+    VX_EXPORT(GetAdaptersAddresses), VX_EXPORT(GetAdaptersInfo),
+    VX_EXPORT(GetBestInterface), VX_EXPORT(GetIfTable), VX_EXPORT(GetIpAddrTable),
+    { "NotifyAddrChange", (void *)iphlp_unsupported }, VX_EXPORT(GetNetworkParams),
+    VX_EXPORT(ConvertInterfaceGuidToLuid), VX_EXPORT(GetIfEntry2),
 };
 static const vx_export gdi32[] = {
     VX_EXPORT(AddFontMemResourceEx), VX_EXPORT(RemoveFontMemResourceEx), VX_EXPORT(CreateICW), VX_EXPORT(CreateICA),

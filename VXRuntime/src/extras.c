@@ -49,6 +49,28 @@ static WINAPI int GetGeoInfoA(int32_t geo, DWORD type, char *data, int size, uin
     return 0;
 }
 
+// ---- dbghelp ----------------------------------------------------------------------------------------------------------
+static WINAPI BOOL MiniDumpWriteDump(HANDLE process, DWORD pid, HANDLE file, uint32_t type,
+                                    const void *exception, const void *streams, const void *callback) {
+    (void)process; (void)pid; (void)file; (void)type; (void)exception; (void)streams; (void)callback;
+    // No dump writer yet: leave the file untouched. This API's last error is an HRESULT, not a Win32 error.
+    vx_set_last_error(0x80070078u);              // HRESULT_FROM_WIN32(ERROR_CALL_NOT_IMPLEMENTED)
+    return 0;
+}
+
+// ---- winhttp ----------------------------------------------------------------------------------------------------------
+static WINAPI BOOL WinHttpGetDefaultProxyConfiguration_impl(void *info) {
+    (void)info;
+    // No WinHTTP default configuration service: do not invent a direct connection policy.
+    vx_set_last_error(120);    // ERROR_CALL_NOT_IMPLEMENTED
+    return 0;
+}
+static WINAPI BOOL WinHttpGetIEProxyConfigForCurrentUser_impl(void *config) {
+    (void)config;
+    vx_set_last_error(120);    // ERROR_CALL_NOT_IMPLEMENTED: no user proxy configuration service.
+    return 0;
+}
+
 // ---- C runtime --------------------------------------------------------------------------------------------------------
 typedef struct { void (*fn)(void *); void *arg; } thread_start;
 static WINAPI DWORD start_thread(void *p) {
@@ -257,6 +279,20 @@ static WINAPI LONG HidP_SetUsages(int type, uint16_t page, uint16_t coll, uint16
     (void)type; (void)page; (void)coll; (void)list; (void)n; (void)pre; (void)report; (void)len; return HIDP_STATUS_NOT_IMPLEMENTED;
 }
 
+// Export wrappers keep the original PE caller, including at optimized builds.
+__attribute__((noinline)) static WINAPI BOOL WinHttpGetDefaultProxyConfiguration(void *info) {
+    const void *caller = VX_RETURN_ADDRESS();
+    BOOL result = WinHttpGetDefaultProxyConfiguration_impl(info);
+    vx_netdiag("WinHttpGetDefaultProxyConfiguration", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI BOOL WinHttpGetIEProxyConfigForCurrentUser(void *config) {
+    const void *caller = VX_RETURN_ADDRESS();
+    BOOL result = WinHttpGetIEProxyConfigForCurrentUser_impl(config);
+    vx_netdiag("WinHttpGetIEProxyConfigForCurrentUser", (int64_t)result, caller);
+    return result;
+}
+
 static const vx_export kernel32_more[] = {
     VX_EXPORT(GetSystemTimes), VX_EXPORT(InitializeProcThreadAttributeList),
     VX_EXPORT(UpdateProcThreadAttribute), VX_EXPORT(DeleteProcThreadAttributeList),
@@ -288,6 +324,8 @@ static const vx_export ucrtbase[] = {
 static const vx_export user32[] = { VX_EXPORT(CreateDialogParamW), VX_EXPORT(SetDlgItemTextW), VX_EXPORT(RemoveMenu), VX_EXPORT(LoadStringW) };
 static const vx_export winmm[] = { VX_EXPORT(waveInStop) };
 static const vx_export ole32[] = { VX_EXPORT(CreateStreamOnHGlobal) };
+static const vx_export winhttp[] = { VX_EXPORT(WinHttpGetDefaultProxyConfiguration), VX_EXPORT(WinHttpGetIEProxyConfigForCurrentUser) };
+static const vx_export dbghelp[] = { VX_EXPORT(MiniDumpWriteDump) };
 static const vx_export avrt[] = { VX_EXPORT(AvSetMmThreadCharacteristicsW), VX_EXPORT(AvRevertMmThreadCharacteristics) };
 static const vx_export advapi32[] = { VX_EXPORT(SetEntriesInAclW), VX_EXPORT(SetFileSecurityW) };
 static const vx_export ws2_32[] = {
@@ -299,15 +337,19 @@ static const vx_export gdiplus[] = {
     VX_EXPORT(GdipCloneImage), VX_EXPORT(GdipDisposeImage), VX_EXPORT(GdipGetImageWidth), VX_EXPORT(GdipGetImageHeight),
     VX_EXPORT(GdipCreateFromHDC), VX_EXPORT(GdipDeleteGraphics), VX_EXPORT(GdipDrawImageRectI),
 };
+void vx_dinput_init(void);
 void vx_extras_init(void) {
     vx_register_module("kernel32.dll", kernel32, sizeof kernel32 / sizeof kernel32[0]);
     vx_register_module("ucrtbase.dll", ucrtbase, sizeof ucrtbase / sizeof ucrtbase[0]);
     vx_register_module("user32.dll", user32, sizeof user32 / sizeof user32[0]);
     vx_register_module("winmm.dll", winmm, sizeof winmm / sizeof winmm[0]);
     vx_register_module("ole32.dll", ole32, sizeof ole32 / sizeof ole32[0]);
+    vx_register_module("dbghelp.dll", dbghelp, sizeof dbghelp / sizeof dbghelp[0]);
+    vx_register_module("winhttp.dll", winhttp, sizeof winhttp / sizeof winhttp[0]);
     vx_register_module("avrt.dll", avrt, sizeof avrt / sizeof avrt[0]);
     vx_register_module("advapi32.dll", advapi32, sizeof advapi32 / sizeof advapi32[0]);
     vx_register_module("ws2_32.dll", ws2_32, sizeof ws2_32 / sizeof ws2_32[0]);
+    vx_dinput_init();
     vx_register_module("gdiplus.dll", gdiplus, sizeof gdiplus / sizeof gdiplus[0]);
 #define MORE(dll, t) vx_register_module(dll, t, sizeof t / sizeof t[0])
     MORE("kernel32.dll", kernel32_more); MORE("kernelbase.dll", kernel32_more); MORE("user32.dll", user32_more);

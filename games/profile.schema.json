@@ -21,6 +21,7 @@
         "properties": {
           "args": {"type": "array", "items": {"type": "string"}, "description": "game arguments after the launcher's own"},
           "seconds": {"type": "number", "minimum": 30, "maximum": 900},
+          "input": {"enum": ["simulated_controllers", "keyboard_mouse"], "description": "keyboard_mouse simulates head pose only; physical input requires a human playtest"},
           "note": {"type": "string"}
         }
       }

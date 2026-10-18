@@ -1,3 +1,4 @@
+#include "renderdiag.h"
 // DXGI on Metal: the factory, the adapter (the Mac's GPU), its output (the main display), and swap chains.
 //
 // A swap chain owns one back buffer texture. Present draws it into the window's CAMetalLayer with a small
@@ -269,7 +270,7 @@ static void client_size(HANDLE hwnd, uint32_t *w, uint32_t *h) {
 static void swapchain_destroy(d3d_object *o);
 static HRESULT swapchain_create(void *factory, void *device, HANDLE hwnd, uint32_t w, uint32_t h, uint32_t format,
                                 uint32_t count, uint32_t usage, uint32_t flags, uint32_t effect, uint32_t samples, void **out) {
-    if (d3d12_is_queue(device)) return d3d12_swapchain_create(factory, device, hwnd, w, h, format, count, flags, out);
+    if (d3d12_is_queue(device)) { vx_renderdiag_stage(RD_D3D12_DELEGATE); return d3d12_swapchain_create(factory, device, hwnd, w, h, format, count, flags, out); }
     d3d_device *dev = d3d_device_from(device);
     vx_window *win = vx_window_get(hwnd);
     if (!dev || !win || !out) return E_INVALIDARG;
@@ -302,18 +303,32 @@ static void swapchain_destroy(d3d_object *o) {
 }
 // DXGI_SWAP_CHAIN_DESC: buffer mode (width, height, refresh, format, ordering, scaling), sample count/quality,
 // usage, buffer count, window, windowed, swap effect, flags.
-static WINAPI HRESULT factory_create_swapchain(void *this, void *device, const uint8_t *desc, void **out) {
+static WINAPI HRESULT factory_create_swapchain_impl(void *this, void *device, const uint8_t *desc, void **out) {
     const uint32_t *mode = (const uint32_t *)desc;
     return swapchain_create(this, device, *(HANDLE *)(desc + 48), mode[0], mode[1], mode[4], *(const uint32_t *)(desc + 40),
                             *(const uint32_t *)(desc + 36), *(const uint32_t *)(desc + 64), *(const uint32_t *)(desc + 60),
                             *(const uint32_t *)(desc + 28), out);
 }
+static WINAPI HRESULT factory_create_swapchain(void *this, void *device, const uint8_t *desc, void **out) {
+    unsigned ticket = vx_renderdiag_begin(RD_SWAPCHAIN);
+    HRESULT hr = factory_create_swapchain_impl(this, device, desc, out);
+    vx_renderdiag_end(RD_SWAPCHAIN, ticket, hr);
+    return hr;
+}
+
 // DXGI_SWAP_CHAIN_DESC1: width, height, format, stereo, sample count/quality, usage, buffer count, scaling,
 // swap effect, alpha mode, flags.
-static WINAPI HRESULT factory_create_swapchain_hwnd(void *this, void *device, HANDLE hwnd, const uint32_t *d, const void *fs, void *output, void **out) {
+static WINAPI HRESULT factory_create_swapchain_hwnd_impl(void *this, void *device, HANDLE hwnd, const uint32_t *d, const void *fs, void *output, void **out) {
     (void)fs; (void)output;
     return swapchain_create(this, device, hwnd, d[0], d[1], d[2], d[7], d[6], d[11], d[9], d[4], out);
 }
+static WINAPI HRESULT factory_create_swapchain_hwnd(void *this, void *device, HANDLE hwnd, const uint32_t *d, const void *fs, void *output, void **out) {
+    unsigned ticket = vx_renderdiag_begin(RD_SWAPCHAIN_HWND);
+    HRESULT hr = factory_create_swapchain_hwnd_impl(this, device, hwnd, d, fs, output, out);
+    vx_renderdiag_end(RD_SWAPCHAIN_HWND, ticket, hr);
+    return hr;
+}
+
 
 static WINAPI HRESULT swapchain_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIDeviceSubObject, &IID_IDXGISwapChain, &IID_IDXGISwapChain1,
@@ -405,16 +420,16 @@ static id<MTLTexture> resolve_back_buffer(swapchain *sc, id<MTLCommandBuffer> cm
     return plain;
 }
 #define DXGI_PRESENT_TEST 1
-static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flags) {
+static WINAPI HRESULT swapchain_present_impl(void *this, uint32_t sync, uint32_t flags) {
     swapchain *sc = this;
-    if (flags & DXGI_PRESENT_TEST) return S_OK;
+    if (flags & DXGI_PRESENT_TEST) { vx_renderdiag_stage(RD_TEST); return S_OK; }
     d3d_flush(sc->dev, 0);                          // the frame's work goes first, on the same queue
     snapshot(sc);
     CAMetalLayer *layer = (__bridge CAMetalLayer *)sc->layer;
     layer.displaySyncEnabled = sync != 0;
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [layer nextDrawable];
-        if (!drawable) return S_OK;                 // hidden or minimized: nothing to show
+        if (!drawable) { vx_renderdiag_stage(RD_NO_DRAWABLE); return S_OK; }                 // hidden or minimized: nothing to show
         id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
         id<MTLTexture> back = (__bridge id<MTLTexture>)sc->buffer->mtl;
         if (back.sampleCount > 1) back = resolve_back_buffer(sc, cmd, back);
@@ -430,10 +445,25 @@ static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flag
         [cmd presentDrawable:drawable];
         [cmd commit];
     }
+    vx_renderdiag_stage(RD_COMMITTED);
     sc->presents++;
     return S_OK;
 }
-static WINAPI HRESULT swapchain_present1(void *this, uint32_t sync, uint32_t flags, const void *params) { (void)params; return swapchain_present(this, sync, flags); }
+static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flags) {
+    unsigned ticket = vx_renderdiag_begin(RD_PRESENT);
+    HRESULT hr = swapchain_present_impl(this, sync, flags);
+    vx_renderdiag_end(RD_PRESENT, ticket, hr);
+    return hr;
+}
+
+static WINAPI HRESULT swapchain_present1_impl(void *this, uint32_t sync, uint32_t flags, const void *params) { (void)params; return swapchain_present(this, sync, flags); }
+static WINAPI HRESULT swapchain_present1(void *this, uint32_t sync, uint32_t flags, const void *params) {
+    unsigned ticket = vx_renderdiag_begin(RD_PRESENT1);
+    HRESULT hr = swapchain_present1_impl(this, sync, flags, params);
+    vx_renderdiag_end(RD_PRESENT1, ticket, hr);
+    return hr;
+}
+
 static WINAPI HRESULT swapchain_resize_buffers(void *this, uint32_t count, uint32_t w, uint32_t h, uint32_t format, uint32_t flags) {
     swapchain *sc = this;
     d3d_flush(sc->dev, 1);

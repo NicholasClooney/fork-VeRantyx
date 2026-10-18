@@ -487,7 +487,7 @@ void __attribute__((noreturn)) vx_unwind(uint64_t target_frame, uint64_t target_
 // ---- __C_specific_handler (the C runtime's handler for __try/__except/__finally) ----------------------------------------------
 typedef struct { DWORD begin, end, handler, target; } scope_record;
 typedef struct { DWORD count; scope_record r[]; } scope_table;
-void vx_rtl_unwind_ex(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t, CONTEXT *, void *) __asm__("_vx_RtlUnwindEx");
+void WINAPI vx_rtl_unwind_ex(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t, CONTEXT *, void *) __asm__("_vx_RtlUnwindEx");
 
 static WINAPI int __C_specific_handler(EXCEPTION_RECORD *rec, uint64_t frame, CONTEXT *ctx, DISPATCHER_CONTEXT *dc) {
     const scope_table *t = dc->handler_data;

@@ -1,3 +1,4 @@
+#include "renderdiag.h"
 // Direct3D 11 on Metal: the device, its resources and views, and the immediate context.
 //
 // Resources are Metal textures and buffers. The immediate context records clears and copies into a Metal command
@@ -602,6 +603,7 @@ static void flush_work(d3d_device *dev, int wait) {
         id<MTLCommandBuffer> pre = CFBridgingRelease(c->pre);
         c->pre = NULL;
         [pre commit];
+        vx_renderdiag_activity(RD_WORK_PRE);
     }
     if (!c->cmd) {
         if (wait) {                                             // still wait for work committed earlier
@@ -629,6 +631,7 @@ static void flush_work(d3d_device *dev, int wait) {
     }];
     d3d_gpu_profile_submit(dev, (__bridge void *)cmd);
     [cmd commit];
+    vx_renderdiag_activity(RD_WORK_MAIN);
     pthread_mutex_lock(&g_recent_lock);
     void *old = g_recent[seq % RECENT];
     g_recent[seq % RECENT] = (void *)CFBridgingRetain(cmd); g_recent_seq[seq % RECENT] = seq; g_recent_dev[seq % RECENT] = dev;
@@ -1414,7 +1417,7 @@ static void make_tables(void) {
 
 // ---- entry points ------------------------------------------------------------------------------------------------------------------
 #define FEATURE_LEVEL_11_0 0xb000
-static WINAPI HRESULT D3D11CreateDevice(void *adapter, uint32_t driver, HANDLE software, uint32_t flags, const uint32_t *levels,
+static WINAPI HRESULT D3D11CreateDevice_impl(void *adapter, uint32_t driver, HANDLE software, uint32_t flags, const uint32_t *levels,
                                         uint32_t nlevels, uint32_t sdk, void **out_device, uint32_t *out_level, void **out_context) {
     (void)adapter; (void)driver; (void)software; (void)sdk;
     if (vx_trace) vx_log("D3D11CreateDevice(driver %u, flags %#x, %u levels)", driver, flags, nlevels);
@@ -1448,9 +1451,17 @@ static WINAPI HRESULT D3D11CreateDevice(void *adapter, uint32_t driver, HANDLE s
     if (out_device) *out_device = d; else d3d_release(&d->base);
     return S_OK;
 }
+static WINAPI HRESULT D3D11CreateDevice(void *adapter, uint32_t driver, HANDLE software, uint32_t flags, const uint32_t *levels,
+                                        uint32_t nlevels, uint32_t sdk, void **out_device, uint32_t *out_level, void **out_context) {
+    unsigned ticket = vx_renderdiag_begin(RD_DEVICE);
+    HRESULT hr = D3D11CreateDevice_impl(adapter, driver, software, flags, levels, nlevels, sdk, out_device, out_level, out_context);
+    vx_renderdiag_end(RD_DEVICE, ticket, hr);
+    return hr;
+}
+
 typedef HRESULT (WINAPI *create_swapchain_fn)(void *factory, void *device, const void *desc, void **out);
 HRESULT dxgi_create_factory(const GUID *iid, void **out);         // dxgi.m
-static WINAPI HRESULT D3D11CreateDeviceAndSwapChain(void *adapter, uint32_t driver, HANDLE software, uint32_t flags, const uint32_t *levels,
+static WINAPI HRESULT D3D11CreateDeviceAndSwapChain_impl(void *adapter, uint32_t driver, HANDLE software, uint32_t flags, const uint32_t *levels,
                                                     uint32_t nlevels, uint32_t sdk, const void *desc, void **out_swapchain,
                                                     void **out_device, uint32_t *out_level, void **out_context) {
     void *dev = NULL, *ctx = NULL;
@@ -1469,6 +1480,15 @@ static WINAPI HRESULT D3D11CreateDeviceAndSwapChain(void *adapter, uint32_t driv
     if (out_context) *out_context = ctx; else d3d_release(ctx);
     return S_OK;
 }
+static WINAPI HRESULT D3D11CreateDeviceAndSwapChain(void *adapter, uint32_t driver, HANDLE software, uint32_t flags, const uint32_t *levels,
+                                                    uint32_t nlevels, uint32_t sdk, const void *desc, void **out_swapchain,
+                                                    void **out_device, uint32_t *out_level, void **out_context) {
+    unsigned ticket = vx_renderdiag_begin(RD_DEVICE_SWAPCHAIN);
+    HRESULT hr = D3D11CreateDeviceAndSwapChain_impl(adapter, driver, software, flags, levels, nlevels, sdk, desc, out_swapchain, out_device, out_level, out_context);
+    vx_renderdiag_end(RD_DEVICE_SWAPCHAIN, ticket, hr);
+    return hr;
+}
+
 
 static const vx_export d3d11[] = { VX_EXPORT(D3D11CreateDevice), VX_EXPORT(D3D11CreateDeviceAndSwapChain) };
 void vx_d3d11_init(void) {

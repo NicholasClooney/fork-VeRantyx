@@ -1,6 +1,10 @@
 // Milestone 2a: threads, waits, events, mutexes, semaphores, condition variables, TLS.
 #include <windows.h>
 #include <stdio.h>
+#include <stddef.h>
+
+_Static_assert(sizeof(CRITICAL_SECTION) == 40, "x64 critical section size");
+_Static_assert(offsetof(CRITICAL_SECTION, SpinCount) == 32, "x64 spin count offset");
 
 static CRITICAL_SECTION cs;
 static volatile LONG counter, interlocked;
@@ -160,18 +164,62 @@ static int stack_walk_ok(void) {
 #pragma pack(push, 4)
 static struct { int pad; CRITICAL_SECTION cs; SRWLOCK srw; CONDITION_VARIABLE cv; } packed __attribute__((aligned(8)));   // (cs: 4 bytes off)
 #pragma pack(pop)
+// Check the full pointer-sized field, including its high half, without requiring 8-byte alignment.
+static ULONG_PTR spin_value(CRITICAL_SECTION *c) {
+    ULONG_PTR spin;
+    memcpy(&spin, (char *)c + offsetof(CRITICAL_SECTION, SpinCount), sizeof spin);
+    return spin;
+}
+static int spin_count_ok(CRITICAL_SECTION *c) {
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    DWORD initial = si.dwNumberOfProcessors > 1 ? 123 : 0;
+    DWORD high = si.dwNumberOfProcessors > 1 ? 0x80000005u : 0;
+    int ok = 1;
+    for (int mode = 0; mode < 3; mode++) {
+        memset(c, 0xa5, sizeof *c);
+        if (mode == 0) InitializeCriticalSection(c);
+        else if (mode == 1) ok &= InitializeCriticalSectionAndSpinCount(c, 123) != 0;
+        else ok &= InitializeCriticalSectionEx(c, 123, 0) != 0;
+        DWORD expected = mode ? initial : 0;
+        ok &= spin_value(c) == expected;
+        EnterCriticalSection(c);
+        EnterCriticalSection(c);
+        unsigned char state[32]; memcpy(state, c, sizeof state);
+        SetLastError(0x1234);
+        ok &= SetCriticalSectionSpinCount(c, 0x80000005u) == expected;
+        ok &= GetLastError() == 0x1234 && spin_value(c) == high;
+        ok &= memcmp(state, c, sizeof state) == 0;
+        ok &= SetCriticalSectionSpinCount(c, 0) == high && spin_value(c) == 0;
+        ok &= SetCriticalSectionSpinCount(c, 0) == 0;
+        BOOL entered = TryEnterCriticalSection(c);
+        ok &= entered != 0;
+        if (entered) LeaveCriticalSection(c);
+        LeaveCriticalSection(c);
+        LeaveCriticalSection(c);
+        DeleteCriticalSection(c);
+    }
+    return ok;
+}
 static volatile LONG packed_cs_count, packed_srw_count;
+static DWORD packed_spin;
 static DWORD WINAPI packed_worker(void *arg) {
     (void)arg;
     for (int i = 0; i < 2000; i++) {
-        EnterCriticalSection(&packed.cs); EnterCriticalSection(&packed.cs); packed_cs_count++; LeaveCriticalSection(&packed.cs); LeaveCriticalSection(&packed.cs);
+        EnterCriticalSection(&packed.cs); EnterCriticalSection(&packed.cs);
+        DWORD old = SetCriticalSectionSpinCount(&packed.cs, 0);
+        DWORD zero = SetCriticalSectionSpinCount(&packed.cs, packed_spin);
+        if (old != packed_spin || zero != 0 || spin_value(&packed.cs) != packed_spin) {
+            LeaveCriticalSection(&packed.cs); LeaveCriticalSection(&packed.cs); return 1;
+        }
+        packed_cs_count++; LeaveCriticalSection(&packed.cs); LeaveCriticalSection(&packed.cs);
         AcquireSRWLockExclusive(&packed.srw); packed_srw_count++; ReleaseSRWLockExclusive(&packed.srw);
         AcquireSRWLockShared(&packed.srw); ReleaseSRWLockShared(&packed.srw);
     }
     return 0;
 }
 static int packed_ok(void) {
-    InitializeCriticalSection(&packed.cs); InitializeSRWLock(&packed.srw); InitializeConditionVariable(&packed.cv);
+    SYSTEM_INFO si; GetSystemInfo(&si); packed_spin = si.dwNumberOfProcessors > 1 ? 31 : 0;
+    InitializeCriticalSectionAndSpinCount(&packed.cs, 31); InitializeSRWLock(&packed.srw); InitializeConditionVariable(&packed.cv);
     HANDLE t[3];
     for (int i = 0; i < 3; i++) t[i] = CreateThread(NULL, 0, packed_worker, NULL, 0, NULL);
     WaitForMultipleObjects(3, t, TRUE, 10000);
@@ -184,6 +232,7 @@ static int packed_ok(void) {
     return packed_cs_count == 6000 && packed_srw_count == 6000 && !woke;
 }
 int main(void) {
+    int sc = spin_count_ok(&cs) && spin_count_ok(&packed.cs);
     InitializeCriticalSection(&cs);
     tls_index = TlsAlloc();
     go = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -210,8 +259,8 @@ int main(void) {
     if (WaitForSingleObject(wt, 5000) != WAIT_OBJECT_0) ok = 0;
     GetExitCodeThread(wt, &wcode);
     int fib = fibers_ok(), sus = suspend_ok(), walk = stack_walk_ok(), pk = packed_ok(), run = stack_run_ok();
-    ok = ok && counter == 40000 && interlocked == 40000 && sems == 4 && wcode == 77 && per_thread == 7 && fib && sus && walk && pk && run;
-    printf("threads: counter=%ld interlocked=%ld semaphores=%d condvar=%lu main_tls=%d fibers=%s suspend+apc=%s stack=%s packed locks=%s stack runs=%s (%d stops inside) -> %s\n",
-           counter, interlocked, sems, wcode, per_thread, fib ? "ok" : "bad", sus ? "ok" : "bad", walk ? "ok" : "bad", pk ? "ok" : "bad", run ? "ok" : "bad", stack_run_inside, ok ? "ok" : "FAILED");
+    ok = ok && counter == 40000 && interlocked == 40000 && sems == 4 && wcode == 77 && per_thread == 7 && fib && sus && walk && pk && run && sc;
+    printf("threads: counter=%ld interlocked=%ld semaphores=%d condvar=%lu main_tls=%d fibers=%s suspend+apc=%s stack=%s packed locks=%s spin count=%s stack runs=%s (%d stops inside) -> %s\n",
+           counter, interlocked, sems, wcode, per_thread, fib ? "ok" : "bad", sus ? "ok" : "bad", walk ? "ok" : "bad", pk ? "ok" : "bad", sc ? "ok" : "bad", run ? "ok" : "bad", stack_run_inside, ok ? "ok" : "FAILED");
     return !ok;
 }

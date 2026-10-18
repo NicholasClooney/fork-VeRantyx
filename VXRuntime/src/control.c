@@ -14,6 +14,8 @@
 //                              painted), or after ms (default 2000) with "idle": false
 // VXRT_CONTROL_LOG=<file>: each request appended with the milliseconds since the socket opened (how an agent worked).
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "ui.h"
+#include "renderdiag.h"
 
 static char g_path[104];
 static FILE *g_log;
@@ -157,4 +160,112 @@ void vx_control_start(const char *path) {
     pthread_t t;
     if (pthread_create(&t, NULL, serve, (void *)(intptr_t)ls) == 0) pthread_detach(t);
     vx_log("control: Command Clips at %s", path);
+}
+
+
+// A separate protocol keeps the full Clip action/text surface out of diagnostics.
+static char g_meta_path[104];
+static dev_t g_meta_dev;
+static ino_t g_meta_ino;
+static int g_meta_mode; // 1 windows, 2 render, 3 both
+static char *diagnostic_snapshot(void) {
+    char *windows = g_meta_mode != 2 ? vx_ui_metadata() : NULL;
+    if (g_meta_mode == 1) return windows;
+    char *render = vx_renderdiag_snapshot();
+    char *out = calloc(1, 4096);
+    if (out && render) {
+        if (windows) { windows[strlen(windows)-1] = 0; snprintf(out, 4096, "%s,\"render\":%s}", windows, render); }
+        else snprintf(out, 4096, "{\"schema_version\":1,\"status\":\"ok\",\"pid\":%d,\"render\":%s}", (int)getpid(), render);
+    } else { free(out); out = NULL; }
+    free(windows); free(render);
+    return out;
+}
+static void metadata_cleanup(void) {
+    struct stat st;
+    if (g_meta_path[0] && !lstat(g_meta_path, &st) && S_ISSOCK(st.st_mode) &&
+        st.st_dev == g_meta_dev && st.st_ino == g_meta_ino) unlink(g_meta_path);
+}
+static int metadata_ready(int fd, short events, double deadline) {
+    for (;;) {
+        double remaining = deadline - now_ms();
+        if (remaining <= 0) return 0;
+        struct pollfd p = { .fd = fd, .events = events };
+        int n = poll(&p, 1, (int)remaining + 1);
+        if (n < 0 && errno == EINTR) continue;
+        return n > 0 && (p.revents & events);
+    }
+}
+static void *metadata_serve(void *arg) {
+    int ls = (int)(intptr_t)arg;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        int fd;
+        do { fd = accept(ls, NULL, NULL); } while (fd < 0 && errno == EINTR);
+        if (fd < 0) break;
+        if (fcntl(fd, F_SETFD, FD_CLOEXEC) || fcntl(fd, F_SETFL, O_NONBLOCK)) { close(fd); continue; }
+        int yes = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof yes);
+        double deadline = now_ms() + 2000;
+        char command[64]; size_t n = 0; int complete = 0;
+        while (n < sizeof command - 1 && metadata_ready(fd, POLLIN, deadline)) {
+            ssize_t k = read(fd, command + n, 1);
+            if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (k != 1) break;
+            if (command[n++] == '\n') { complete = 1; break; }
+        }
+        command[n] = 0;
+        char *state = complete && !strcmp(command, "metadata\n") ? diagnostic_snapshot() : NULL;
+        const char *response = state ? state : "{\"status\":\"rejected\"}";
+        char wire[4096]; int len = snprintf(wire, sizeof wire, "%s\n", response);
+        free(state);
+        size_t sent = 0;
+        while (len > 0 && (size_t)len < sizeof wire && sent < (size_t)len && metadata_ready(fd, POLLOUT, deadline)) {
+            ssize_t k = write(fd, wire + sent, (size_t)len - sent);
+            if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (k <= 0) break;
+            sent += (size_t)k;
+        }
+        close(fd);
+    }
+    close(ls);
+    metadata_cleanup();
+    return NULL;
+}
+void vx_control_metadata_start(const char *exe) {
+    const char *mode = getenv("VXRT_CONTROL_DIAG"), *target = getenv("VXRT_CONTROL_TARGET");
+    const char *path = getenv("VXRT_CONTROL_DIAG_SOCKET");
+    if (!mode || !target || !path || getenv("VXRT_CHILD")) return;
+    int selected = !strcmp(mode, "metadata") ? 1 : !strcmp(mode, "render") ? 2 : !strcmp(mode, "metadata_render") ? 3 : 0;
+    if (!selected) return;
+    char *real = realpath(target, NULL);
+    int matches = real && !strcmp(real, exe);
+    free(real);
+    if (!matches || strlen(path) >= sizeof g_meta_path || strncmp(path, "/private/tmp/vxclip-", 20)) return;
+    char parent[104]; snprintf(parent, sizeof parent, "%s", path);
+    char *slash = strrchr(parent, '/');
+    if (!slash || strcmp(slash, "/control.sock")) return;
+    *slash = 0;
+    struct stat st;
+    char *canonical = realpath(parent, NULL);
+    int valid = canonical && !strcmp(canonical, parent);
+    free(canonical);
+    if (!valid || lstat(parent, &st) || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 0777) != 0700) return;
+    if (!lstat(path, &st) || errno != ENOENT) return;
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ls < 0) return;
+    if (fcntl(ls, F_SETFD, FD_CLOEXEC)) { close(ls); return; }
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    snprintf(address.sun_path, sizeof address.sun_path, "%s", path);
+    // The private directory protects the short interval before chmod.
+    if (bind(ls, (struct sockaddr *)&address, sizeof address)) { close(ls); return; }
+    if (lstat(path, &st)) { close(ls); return; }
+    snprintf(g_meta_path, sizeof g_meta_path, "%s", path);
+    g_meta_dev = st.st_dev; g_meta_ino = st.st_ino;
+    if (chmod(path, 0600) || listen(ls, 3)) { close(ls); metadata_cleanup(); return; }
+    atexit(metadata_cleanup);
+    g_meta_mode = selected;
+    if (selected & 2) vx_renderdiag_enable();
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, metadata_serve, (void *)(intptr_t)ls)) {
+        close(ls); metadata_cleanup(); return;
+    }
+    pthread_detach(thread);
 }

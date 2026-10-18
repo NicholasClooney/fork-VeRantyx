@@ -159,6 +159,11 @@ static WINAPI int __stdio_common_vsnprintf_s(uint64_t options, char *buf, size_t
     return __stdio_common_vsprintf(options, buf, count, fmt, locale, ap);
 }
 
+static WINAPI intptr_t vx_get_heap_handle(void) {
+    // CRT allocation and the Win32 heap APIs share this runtime's process heap.
+    HANDLE (WINAPI *get_heap)(void) = (HANDLE (WINAPI *)(void))vx_find_export("kernel32.dll", "GetProcessHeap");
+    return (intptr_t)get_heap();
+}
 static WINAPI int vx_fflush(vx_file *f) { return f && f->f ? fflush(f->f) : 0; }
 static WINAPI int vx_setvbuf(vx_file *f, char *b, int m, size_t s) { (void)f; (void)b; (void)m; (void)s; return 0; }
 static WINAPI int vx_puts(const char *s) { return write_all(1, s, strlen(s)) || write_all(1, "\n", 1) ? -1 : 0; }
@@ -229,9 +234,48 @@ static WINAPI int vx_remove(const char *p) { return path_call(p, unlink); }
 static WINAPI int vx_rmdir(const char *p) { return path_call(p, rmdir); }
 static WINAPI int vx_mkdir(const char *p) { return path_call(p, mkdir_default); }
 static WINAPI int vx_rename(const char *from, const char *to) {
-    char a[4096], b[4096];
-    if (!vx_unix_path(from, a, sizeof a) || !vx_unix_path_write(to, b, sizeof b, 0)) { set_errno(2); return -1; }
-    if (rename(a, b)) { set_errno(errno); return -1; }
+    char a[4096], b[4096], shadow[4096], tmp[4096];
+    struct stat st;
+    if (!vx_unix_path(from, a, sizeof a) || !vx_unix_path(to, b, sizeof b)) { set_errno(2); return -1; }
+    // CRT rename must not replace an existing destination, including one only in the original tree.
+    if (!lstat(b, &st)) { set_errno(EEXIST); return -1; }
+    if (errno != ENOENT) { set_errno(errno); return -1; }
+    if (lstat(a, &st)) { set_errno(errno); return -1; }
+    if (!vx_unix_path_write(from, shadow, sizeof shadow, 0) ||
+        !vx_unix_path_write(to, b, sizeof b, 0)) { set_errno(2); return -1; }
+    if (!strcmp(a, shadow)) {
+        if (renamex_np(a, b, RENAME_EXCL)) { set_errno(errno); return -1; }
+        return 0;
+    }
+    // Never move an original tree entry. Merged directories need tombstones and recursive copy support first.
+    if (!S_ISREG(st.st_mode)) { set_errno(EACCES); return -1; }
+    if (snprintf(tmp, sizeof tmp, "%s.rename.XXXXXX", shadow) >= (int)sizeof tmp) { set_errno(ENAMETOOLONG); return -1; }
+    int in = open(a, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (in < 0) { set_errno(errno); return -1; }
+    int out = mkstemp(tmp), error = out < 0 ? errno : 0;
+    if (out >= 0) {
+        char buf[65536];
+        ssize_t n;
+        while (!error) {
+            n = read(in, buf, sizeof buf);
+            if (n < 0) { if (errno == EINTR) continue; error = errno; break; }
+            if (!n) break;
+            for (ssize_t off = 0; off < n;) {
+                ssize_t k = write(out, buf + off, (size_t)(n - off));
+                if (k < 0 && errno == EINTR) continue;
+                if (k <= 0) { error = k < 0 ? errno : EIO; break; }
+                off += k;
+            }
+        }
+        if (close(out) && !error) error = errno;
+    }
+    close(in);
+    // Publish only a complete copy; a failed rename must leave neither a partial destination nor a shadow source.
+    if (out >= 0) {
+        if (!error && renamex_np(tmp, b, RENAME_EXCL)) error = errno;
+        if (error) unlink(tmp);
+    }
+    if (error) { set_errno(error); return -1; }
     return 0;
 }
 static WINAPI int vx_access(const char *p, int mode) {
@@ -285,6 +329,12 @@ static WINAPI int _configure_wide_argv(int mode) {
 static WINAPI WCHAR ***__p___wargv(void) { _configure_wide_argv(0); return &g_wargv; }
 static WINAPI int _initialize_wide_environment(void) { _get_initial_wide_environment(); return 0; }
 static WINAPI WCHAR *vx_wcscpy(WCHAR *d, const WCHAR *s) { WCHAR *r = d; while ((*d++ = *s++)) {} return r; }
+static WINAPI WCHAR *vx_wcsncpy(WCHAR *d, const WCHAR *s, size_t n) {
+    size_t i = 0;
+    while (i < n && s[i]) { d[i] = s[i]; i++; }
+    while (i < n) d[i++] = 0;
+    return d;
+}
 static WINAPI WCHAR *vx_wcscat(WCHAR *d, const WCHAR *s) { WCHAR *r = d; while (*d) d++; while ((*d++ = *s++)) {} return r; }
 static WINAPI WCHAR *vx_wcsrchr(const WCHAR *s, WCHAR c) { const WCHAR *last = NULL; do if (*s == c) last = s; while (*s++); return (WCHAR *)last; }
 static WINAPI unsigned char *vx_mbsstr(const unsigned char *h, const unsigned char *n) { return (unsigned char *)strstr((const char *)h, (const char *)n); }
@@ -414,7 +464,39 @@ static WINAPI int vx_read(int fd, void *buf, unsigned n) { return (int)read(fd, 
 static WINAPI int vx_setmode(int fd, int mode) { (void)fd; (void)mode; return 0x8000; /* _O_BINARY: no newline translation here */ }
 static WINAPI void *vx_memchr(const void *p, int c, size_t n) { return memchr(p, c, n); }
 static WINAPI size_t vx_strnlen(const char *s, size_t n) { return strnlen(s, n); }
-static WINAPI char *vx_strerror(int e) { return strerror(e); }
+static WINAPI char *vx_strerror(int e) {
+    // Windows errno numbers differ from Darwin's, including EAGAIN and EILSEQ.
+    static const char *const messages[] = {
+        [0] = "No error", [1] = "Operation not permitted", [2] = "No such file or directory",
+        [3] = "No such process", [4] = "Interrupted function call", [5] = "Input/output error",
+        [6] = "No such device or address", [7] = "Arg list too long", [8] = "Exec format error",
+        [9] = "Bad file descriptor", [10] = "No child processes", [11] = "Resource temporarily unavailable",
+        [12] = "Not enough space", [13] = "Permission denied", [14] = "Bad address",
+        [16] = "Device or resource busy", [17] = "File exists", [18] = "Cross-device link", [19] = "No such device",
+        [20] = "Not a directory", [21] = "Is a directory", [22] = "Invalid argument",
+        [23] = "Too many open files in system", [24] = "Too many open files", [25] = "Inappropriate I/O control operation",
+        [27] = "File too large", [28] = "No space left on device", [29] = "Invalid seek",
+        [30] = "Read-only file system", [31] = "Too many links", [32] = "Broken pipe",
+        [33] = "Domain error", [34] = "Result too large", [36] = "Resource deadlock avoided",
+        [38] = "Filename too long", [39] = "No locks available", [40] = "Function not implemented",
+        [41] = "Directory not empty", [42] = "Illegal byte sequence",
+        [100] = "Address in use", [101] = "Address not available", [102] = "Address family not supported",
+        [103] = "Connection already in progress", [104] = "Bad message", [105] = "Operation canceled",
+        [106] = "Connection aborted", [107] = "Connection refused", [108] = "Connection reset",
+        [109] = "Destination address required", [110] = "Host unreachable", [111] = "Identifier removed",
+        [112] = "Operation in progress", [113] = "Already connected", [114] = "Too many symbolic link levels",
+        [115] = "Message too long", [116] = "Network down", [117] = "Network reset",
+        [118] = "Network unreachable", [119] = "No buffer space", [120] = "No message available",
+        [121] = "No link", [122] = "No message", [123] = "No protocol option",
+        [124] = "No stream resources", [125] = "Not a stream", [126] = "Not connected",
+        [127] = "State not recoverable", [128] = "Not a socket", [129] = "Not supported",
+        [130] = "Operation not supported", [131] = "Other error", [132] = "Value too large",
+        [133] = "Owner dead", [134] = "Protocol error", [135] = "Protocol not supported",
+        [136] = "Wrong protocol type", [137] = "Stream timeout", [138] = "Timed out",
+        [139] = "Text file busy", [140] = "Operation would block",
+    };
+    return (char *)(e >= 0 && (size_t)e < sizeof messages / sizeof *messages && messages[e] ? messages[e] : "Unknown error");
+}
 static WINAPI size_t crt_wcslen(const WCHAR *s) { size_t n = 0; while (s[n]) n++; return n; }
 static WINAPI int vx_wcscmp(const WCHAR *a, const WCHAR *b) { while (*a && *a == *b) { a++; b++; } return (*a > *b) - (*a < *b); }
 static WINAPI size_t vx_wcsnlen(const WCHAR *s, size_t max) { size_t n = 0; while (n < max && s[n]) n++; return n; }
@@ -886,6 +968,27 @@ static WINAPI int vx_set_fmode(int m) { g_fmode = m; return 0; }
 static WINAPI int vx_get_fmode(int *m) { *m = g_fmode; return 0; }
 static WINAPI void vx_c_exit(void) {}
 static WINAPI void vx_invalid_parameter_noinfo(void) { if (vx_trace) vx_log("the program reported an invalid parameter to the C runtime"); }
+static WINAPI int vx_strerror_s(char *buffer, size_t size, int error) {
+    if (!buffer || !size) { vx_invalid_parameter_noinfo(); set_errno(22); return 22; }
+    const char *message = vx_strerror(error);
+    size_t n = strlen(message);
+    if (n >= size) n = size - 1;
+    memcpy(buffer, message, n);
+    buffer[n] = 0;
+    return 0;
+}
+static WINAPI double vx_wtof(const WCHAR *s) {
+    if (!s) { vx_invalid_parameter_noinfo(); set_errno(22); return 0.0; }
+    char *a = vx_utf8_dup(s);
+    if (!a) { set_errno(12); return 0.0; }
+    // The runtime supports the C locale; conversion must not truncate long numeric prefixes.
+    errno = 0;
+    double value = strtod(a, NULL);
+    int error = errno;
+    free(a);
+    if (error == ERANGE) set_errno(34);    // Windows errno is separate from the host's.
+    return value;
+}
 // What the C runtime calls when a checked function got an invalid parameter and no handler took it: Windows ends the
 // process (__fastfail, STATUS_INVALID_CRUNTIME_PARAMETER).
 static WINAPI void vx_invoke_watson(const WCHAR *expr, const WCHAR *func, const WCHAR *file, unsigned line, uintptr_t reserved) {
@@ -1020,7 +1123,7 @@ static const vx_export ucrt[] = {
     { "_wgetcwd", (void *)vx_wgetcwd }, { "_dclass", (void *)vx_dclass }, { "_fdclass", (void *)vx_fdclass }, { "_ldclass", (void *)vx_ldclass }, { "_dsign", (void *)vx_dsign },
     { "_fdsign", (void *)vx_fdsign }, { "copysign", (void *)vx_copysign }, { "_copysign", (void *)vx_copysign }, { "lgamma", (void *)vx_lgamma },
     { "lgammal", (void *)vx_lgamma }, { "lgammaf", (void *)vx_lgammaf }, { "__strncnt", (void *)vx_strncnt }, { "_wcsdup", (void *)vx_wcsdup },
-    { "strcspn", (void *)vx_strcspn }, { "strtof", (void *)vx_strtof }, { "wcstod", (void *)vx_wcstod }, { "wcstof", (void *)vx_wcstof },
+    { "strcspn", (void *)vx_strcspn }, { "strtof", (void *)vx_strtof }, { "wcstod", (void *)vx_wcstod }, { "wcstof", (void *)vx_wcstof }, { "_wtof", (void *)vx_wtof },
     { "_fsopen", (void *)vx_fsopen }, { "_wfsopen", (void *)vx_wfsopen }, { "_get_stream_buffer_pointers", (void *)vx_get_stream_buffer_pointers },
     { "fgetpos", (void *)vx_fgetpos }, { "fsetpos", (void *)vx_fsetpos }, { "fgetwc", (void *)vx_fgetwc }, { "fputwc", (void *)vx_fputwc },
     { "ungetwc", (void *)vx_ungetwc }, { "_Getdays", (void *)vx_Getdays }, { "_Getmonths", (void *)vx_Getmonths },
@@ -1073,6 +1176,7 @@ static const vx_export ucrt[] = {
     VX_EXPORT(_initterm), VX_EXPORT(_initterm_e), VX_EXPORT(_crt_atexit), { "atexit", (void *)vx_atexit },
     VX_EXPORT(_cexit), { "exit", (void *)vx_exit }, { "_exit", (void *)vx__exit }, { "abort", (void *)vx_abort },
     { "malloc", (void *)vx_malloc }, { "calloc", (void *)vx_calloc }, { "realloc", (void *)vx_realloc }, { "free", (void *)vx_free },
+    { "_get_heap_handle", (void *)vx_get_heap_handle },
     { "memcpy", (void *)vx_memcpy }, { "memmove", (void *)vx_memmove }, { "memset", (void *)vx_memset }, { "memcmp", (void *)vx_memcmp },
     { "strlen", (void *)vx_strlen }, { "strcmp", (void *)vx_strcmp }, { "strncmp", (void *)vx_strncmp },
     { "strcpy", (void *)vx_strcpy }, { "strncpy", (void *)vx_strncpy }, { "strcat", (void *)vx_strcat },
@@ -1086,8 +1190,8 @@ static const vx_export ucrt[] = {
     { "_errno", (void *)vx__errno }, { "qsort", (void *)vx_qsort },
     { "_assert", (void *)vx_assert }, { "_fileno", (void *)vx_fileno }, { "_lock_file", (void *)vx_lock_file },
     { "_unlock_file", (void *)vx_lock_file }, { "_read", (void *)vx_read }, { "_setmode", (void *)vx_setmode },
-    { "memchr", (void *)vx_memchr }, { "strnlen", (void *)vx_strnlen }, { "strerror", (void *)vx_strerror },
-    { "wcslen", (void *)crt_wcslen }, { "wcsnlen", (void *)vx_wcsnlen }, { "rand_s", (void *)vx_rand_s },
+    { "memchr", (void *)vx_memchr }, { "strnlen", (void *)vx_strnlen }, { "strerror", (void *)vx_strerror }, { "strerror_s", (void *)vx_strerror_s },
+    { "wcslen", (void *)crt_wcslen }, { "wcsnlen", (void *)vx_wcsnlen }, { "wcsncpy", (void *)vx_wcsncpy }, { "rand_s", (void *)vx_rand_s },
     { "localeconv", (void *)vx_localeconv }, { "mbrtowc", (void *)vx_mbrtowc }, { "mbsrtowcs", (void *)vx_mbsrtowcs },
     { "wcrtomb", (void *)vx_wcrtomb }, { "wcscmp", (void *)vx_wcscmp },
     VX_EXPORT(_initialize_onexit_table), VX_EXPORT(_register_onexit_function), VX_EXPORT(_execute_onexit_table),

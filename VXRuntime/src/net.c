@@ -75,7 +75,7 @@ static int addr_out(const struct sockaddr *a, socklen_t alen, void *win, int *le
 
 // ---- startup ------------------------------------------------------------------------------------------------------------
 // WSADATA (x64): version, high version, max sockets, max UDP datagram, vendor info, description[257], status[129].
-static WINAPI int WSAStartup(uint16_t version, uint8_t *data) {
+static WINAPI int WSAStartup_impl(uint16_t version, uint8_t *data) {
     if (data) {
         memset(data, 0, 408);
         *(uint16_t *)data = version < 0x0202 ? version : 0x0202;
@@ -90,7 +90,7 @@ static WINAPI int WSAGetLastError(void) { return (int)vx_get_last_error(); }
 static WINAPI void WSASetLastError(int e) { vx_set_last_error((DWORD)e); }
 
 // ---- sockets -----------------------------------------------------------------------------------------------------------------
-static WINAPI SOCKET ws_socket(int af, int type, int protocol) {
+static WINAPI SOCKET ws_socket_impl(int af, int type, int protocol) {
     int fd = socket(family_in(af), type, protocol);
     if (fd < 0) { fail(); return INVALID_SOCKET; }
     int one = 1;
@@ -98,14 +98,14 @@ static WINAPI SOCKET ws_socket(int af, int type, int protocol) {
     fcntl(fd, F_SETFD, FD_CLOEXEC);
     return (SOCKET)fd;
 }
-static WINAPI SOCKET WSASocketA(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) { (void)info; (void)group; (void)flags; return ws_socket(af, type, protocol); }
-static WINAPI SOCKET WSASocketW(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) { (void)info; (void)group; (void)flags; return ws_socket(af, type, protocol); }
+static WINAPI SOCKET WSASocketA_impl(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) { (void)info; (void)group; (void)flags; return ws_socket_impl(af, type, protocol); }
+static WINAPI SOCKET WSASocketW_impl(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) { (void)info; (void)group; (void)flags; return ws_socket_impl(af, type, protocol); }
 static WINAPI int closesocket(SOCKET s) { return close(to_fd(s)) ? fail() : 0; }
-static WINAPI int ws_bind(SOCKET s, const void *addr, int len) {
+static WINAPI int ws_bind_impl(SOCKET s, const void *addr, int len) {
     struct sockaddr_storage a; socklen_t l = addr_in(addr, len, &a);
     return bind(to_fd(s), (struct sockaddr *)&a, l) ? fail() : 0;
 }
-static WINAPI int ws_connect(SOCKET s, const void *addr, int len) {
+static WINAPI int ws_connect_impl(SOCKET s, const void *addr, int len) {
     struct sockaddr_storage a; socklen_t l = addr_in(addr, len, &a);
     return connect(to_fd(s), (struct sockaddr *)&a, l) ? fail() : 0;
 }
@@ -307,7 +307,7 @@ static WINAPI void GetAcceptExSockaddrs(void *buf, DWORD data, DWORD local_len, 
 
 // ---- options and modes -------------------------------------------------------------------------------------------------------
 #define WIN_SOL_SOCKET 0xffff
-static WINAPI int ws_setsockopt(SOCKET s, int level, int opt, const char *val, int len) {
+static WINAPI int ws_setsockopt_impl(SOCKET s, int level, int opt, const char *val, int len) {
     int fd = to_fd(s);
     if (level == WIN_SOL_SOCKET) {
         if (opt == 0x1005 || opt == 0x1006) {                    // SO_SNDTIMEO / SO_RCVTIMEO: a DWORD of milliseconds
@@ -426,7 +426,7 @@ static void *extension_function(const uint8_t *guid) {
 #define SIO_GET_EXTENSION_FUNCTION_POINTER 0xC8000006u
 #define SIO_UDP_CONNRESET 0x9800000Cu
 #define SIO_KEEPALIVE_VALS 0x98000004u
-static WINAPI int WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_len, void *out, DWORD out_len, DWORD *got, void *ov, void *cr) {
+static WINAPI int WSAIoctl_impl(SOCKET s, DWORD code, void *in, DWORD in_len, void *out, DWORD out_len, DWORD *got, void *ov, void *cr) {
     (void)in_len; (void)out_len; (void)cr;
     if (got) *got = 0;
     int r = SOCKET_ERROR;
@@ -621,7 +621,7 @@ static WIN_ADDRINFO *convert_list(struct addrinfo *res) {
     }
     return head;
 }
-static WINAPI int ws_getaddrinfo(const char *node, const char *service, const WIN_ADDRINFO *hints, WIN_ADDRINFO **out) {
+static WINAPI int ws_getaddrinfo_impl(const char *node, const char *service, const WIN_ADDRINFO *hints, WIN_ADDRINFO **out) {
     struct addrinfo h = { 0 }, *res = NULL;
     if (hints) { h.ai_flags = hints->flags & (AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_ADDRCONFIG); h.ai_family = family_in(hints->family); h.ai_socktype = hints->socktype; h.ai_protocol = hints->protocol; }
     int r = getaddrinfo(node, service, &h, &res);
@@ -639,7 +639,7 @@ static WINAPI void ws_freeaddrinfo(WIN_ADDRINFO *a) {
 }
 static WINAPI int GetAddrInfoW(const WCHAR *node, const WCHAR *service, const WIN_ADDRINFO *hints, WIN_ADDRINFO **out) {
     char *n = vx_utf8_dup(node), *s = vx_utf8_dup(service);
-    int r = ws_getaddrinfo(n, s, hints, out);   // the W form's canonical names stay UTF-8 (rarely read)
+    int r = ws_getaddrinfo_impl(n, s, hints, out);   // the W form's canonical names stay UTF-8 (rarely read)
     free(n); free(s);
     return r;
 }
@@ -647,6 +647,62 @@ static WINAPI int ws_getnameinfo(const void *addr, int len, char *host, DWORD hl
     struct sockaddr_storage a; socklen_t l = addr_in(addr, len, &a);
     int r = getnameinfo((struct sockaddr *)&a, l, host, hlen, serv, slen, flags);
     return r ? 11001 : 0;
+}
+
+// Export wrappers keep the original PE caller, including at optimized builds.
+__attribute__((noinline)) static WINAPI int WSAStartup(uint16_t version, uint8_t *data) {
+    const void *caller = VX_RETURN_ADDRESS();
+    int result = WSAStartup_impl(version, data);
+    vx_netdiag("WSAStartup", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI SOCKET ws_socket(int af, int type, int protocol) {
+    const void *caller = VX_RETURN_ADDRESS();
+    SOCKET result = ws_socket_impl(af, type, protocol);
+    vx_netdiag("socket", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI SOCKET WSASocketA(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) {
+    const void *caller = VX_RETURN_ADDRESS();
+    SOCKET result = WSASocketA_impl(af, type, protocol, info, group, flags);
+    vx_netdiag("WSASocketA", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI SOCKET WSASocketW(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) {
+    const void *caller = VX_RETURN_ADDRESS();
+    SOCKET result = WSASocketW_impl(af, type, protocol, info, group, flags);
+    vx_netdiag("WSASocketW", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI int ws_bind(SOCKET s, const void *addr, int len) {
+    const void *caller = VX_RETURN_ADDRESS();
+    int result = ws_bind_impl(s, addr, len);
+    vx_netdiag("bind", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI int ws_connect(SOCKET s, const void *addr, int len) {
+    const void *caller = VX_RETURN_ADDRESS();
+    int result = ws_connect_impl(s, addr, len);
+    vx_netdiag("connect", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI int ws_setsockopt(SOCKET s, int level, int opt, const char *val, int len) {
+    const void *caller = VX_RETURN_ADDRESS();
+    int result = ws_setsockopt_impl(s, level, opt, val, len);
+    vx_netdiag("setsockopt", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI int WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_len, void *out, DWORD out_len, DWORD *got, void *ov, void *cr) {
+    const void *caller = VX_RETURN_ADDRESS();
+    int result = WSAIoctl_impl(s, code, in, in_len, out, out_len, got, ov, cr);
+    vx_netdiag("WSAIoctl", (int64_t)result, caller);
+    return result;
+}
+__attribute__((noinline)) static WINAPI int ws_getaddrinfo(const char *node, const char *service, const WIN_ADDRINFO *hints, WIN_ADDRINFO **out) {
+    const void *caller = VX_RETURN_ADDRESS();
+    int result = ws_getaddrinfo_impl(node, service, hints, out);
+    vx_netdiag("getaddrinfo", (int64_t)result, caller);
+    return result;
 }
 
 #define NET(name, fn) { name, (void *)fn }

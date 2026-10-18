@@ -161,7 +161,13 @@ int vx_unix_path(const char *win, char *out, size_t cap) {
 int vx_unix_path_write(const char *win, char *out, size_t cap, int keep_contents) {
     if (!vx_unix_path(win, out, cap)) return 0;
     char shadow[MAX_PATH_LEN];
-    if (!overlay_shadow(out, shadow, sizeof shadow)) return 1;
+    if (!overlay_shadow(out, shadow, sizeof shadow)) {
+        // A shadow path that does not fit must fail, never fall back to writing the original tree.
+        if (g_ov_len && !strncasecmp(out, g_ov_tree, g_ov_len) && (!out[g_ov_len] || out[g_ov_len] == '/')) {
+            vx_set_last_error(206); return 0;
+        }
+        return 1;
+    }
     make_parent_dirs(shadow);
     struct stat st;
     if (keep_contents && !stat(out, &st) && S_ISREG(st.st_mode)) copy_file(out, shadow);
@@ -225,6 +231,82 @@ static WINAPI DWORD GetFullPathNameW(const WCHAR *name, DWORD cap, WCHAR *buf, W
         *file_part = last && last[1] ? last + 1 : NULL;
     }
     return r;
+}
+
+// SearchPath's default process search policy is not implemented. Explicit paths use the
+// same drive mapping and overlay as file reads, without borrowing the host's PATH.
+static int search_path_candidate(const char *candidate, char *full) {
+    if ((candidate[0] == '\\' && candidate[1] == '\\') ||
+        (candidate[0] == '/' && candidate[1] == '/') || strpbrk(candidate, "*?")) {
+        vx_set_last_error(50); return -1;
+    }
+    if (!vx_full_path(candidate, full, MAX_PATH_LEN)) { vx_set_last_error(206); return -1; }
+    char raw[MAX_PATH_LEN], shadow[MAX_PATH_LEN], path[MAX_PATH_LEN];
+    int n;
+    if (full[0] == 'C') n = snprintf(raw, sizeof raw, "%s/drive_c%s", g_root, full + 2);
+    else if (full[0] == 'Z') n = snprintf(raw, sizeof raw, "%s", full + 2);
+    else { vx_set_last_error(50); return -1; }
+    if (n < 0 || (size_t)n >= sizeof raw) { vx_set_last_error(206); return -1; }
+    for (char *c = raw; *c; ++c) if (*c == '\\') *c = '/';
+    // vx_unix_path intentionally falls back when a shadow cannot be stat'ed. Search
+    // must not turn an unreadable shadow into a successful hit in the original tree.
+    struct stat st;
+    if (g_ov_len && !strncasecmp(raw, g_ov_tree, g_ov_len) &&
+        (!raw[g_ov_len] || raw[g_ov_len] == '/')) {
+        if (!overlay_shadow(raw, shadow, sizeof shadow)) { vx_set_last_error(206); return -1; }
+        if (stat(shadow, &st) && errno != ENOENT && errno != ENOTDIR) {
+            set_error_from_errno(); return -1;
+        }
+    }
+    if (!vx_unix_path(full, path, sizeof path)) return -1;
+    if (!stat(path, &st)) return S_ISREG(st.st_mode) ? 1 : 0;
+    if (errno == ENOENT || errno == ENOTDIR) return 0;
+    set_error_from_errno(); return -1;
+}
+static WINAPI DWORD SearchPathW(const WCHAR *dirs, const WCHAR *name, const WCHAR *extension,
+                               DWORD cap, WCHAR *out, WCHAR **part) {
+    if (!name || !*name || (cap && !out)) { vx_set_last_error(87); return 0; }
+    char *file = vx_utf8_dup(name), *list = vx_utf8_dup(dirs), *ext = vx_utf8_dup(extension);
+    DWORD result = 0;
+    if (!file || (dirs && !list) || (extension && !ext)) { vx_set_last_error(8); goto done; }
+    const char *base = file;
+    for (const char *c = file; *c; ++c) if (*c == '\\' || *c == '/' || *c == ':') base = c + 1;
+    int explicit_path = base != file;
+    if ((!explicit_path && (!list || !*list)) || (ext && *ext && *ext != '.')) {
+        vx_set_last_error(50); goto done;
+    }
+    const char *suffix = ext && !strchr(base, '.') ? ext : "";
+    char leaf[MAX_PATH_LEN], candidate[MAX_PATH_LEN], full[MAX_PATH_LEN];
+    int n = snprintf(leaf, sizeof leaf, "%s%s", file, suffix);
+    if (n < 0 || (size_t)n >= sizeof leaf) { vx_set_last_error(206); goto done; }
+    char *cursor = list;
+    for (;;) {
+        if (explicit_path) strcpy(candidate, leaf);
+        else {
+            char *end = strchr(cursor, ';');
+            size_t len = end ? (size_t)(end - cursor) : strlen(cursor);
+            if (!len) { vx_set_last_error(50); goto done; }
+            n = snprintf(candidate, sizeof candidate, "%.*s\\%s", (int)len, cursor, leaf);
+            if (n < 0 || (size_t)n >= sizeof candidate) { vx_set_last_error(206); goto done; }
+            cursor = end ? end + 1 : NULL;
+        }
+        int hit = search_path_candidate(candidate, full);
+        if (hit < 0) goto done;
+        if (hit) {
+            result = vx_return_string_w(full, out, cap);
+            if (out && result < cap && part) {
+                WCHAR *last = out;
+                for (WCHAR *c = out; *c; ++c) if (*c == '\\') last = c + 1;
+                *part = last;
+            }
+            goto done;
+        }
+        if (explicit_path || !cursor) break;
+    }
+    vx_set_last_error(2);
+done:
+    free(file); free(list); free(ext);
+    return result;
 }
 
 static WINAPI DWORD GetTempPathA(DWORD cap, char *buf) { return vx_return_string_a("C:\\windows\\temp\\", buf, cap); }
@@ -781,7 +863,7 @@ static const vx_export files_k32[] = {
     VX_EXPORT(CreateFileMappingA), VX_EXPORT(CreateFileMappingW), VX_EXPORT(OpenFileMappingA), VX_EXPORT(OpenFileMappingW),
     VX_EXPORT(MapViewOfFile), VX_EXPORT(MapViewOfFileEx), VX_EXPORT(UnmapViewOfFile), VX_EXPORT(FlushViewOfFile),
     VX_EXPORT(GetCurrentDirectoryA), VX_EXPORT(GetCurrentDirectoryW), VX_EXPORT(SetCurrentDirectoryA), VX_EXPORT(SetCurrentDirectoryW),
-    VX_EXPORT(GetFullPathNameA), VX_EXPORT(GetFullPathNameW), VX_EXPORT(GetTempPathA), VX_EXPORT(GetTempPathW),
+    VX_EXPORT(SearchPathW), VX_EXPORT(GetFullPathNameA), VX_EXPORT(GetFullPathNameW), VX_EXPORT(GetTempPathA), VX_EXPORT(GetTempPathW),
     VX_EXPORT(GetWindowsDirectoryA), VX_EXPORT(GetWindowsDirectoryW), VX_EXPORT(GetSystemDirectoryA), VX_EXPORT(GetSystemDirectoryW),
     VX_EXPORT(CreateFileA), VX_EXPORT(CreateFileW), VX_EXPORT(ReadFile), VX_EXPORT(SetFilePointer), VX_EXPORT(SetFilePointerEx),
     VX_EXPORT(GetFileSize), VX_EXPORT(GetFileSizeEx), VX_EXPORT(SetEndOfFile), VX_EXPORT(FlushFileBuffers), VX_EXPORT(GetFileType),

@@ -22,6 +22,12 @@
 # a second after ~5 s).
 set -euo pipefail
 
+# Reject before any build or ALVR dependency resolution; ALVR owns separate network listeners.
+if [[ "${VERANTYX_LOOPBACK_ONLY:-0}" == 1 && "${VERANTYX_ALVR:-0}" == 1 ]]; then
+    echo "VERANTYX_LOOPBACK_ONLY=1 cannot be used with VERANTYX_ALVR=1" >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/vxrt_paths.sh"                  # STEAM_ROOT, VXRT_DLL_DIRS (no Wine prefix needed)
@@ -181,7 +187,9 @@ ENCODER_PID=$!
 # Half-Life: Alyx's (it gives up after a minute without the page's "ready").
 "$HELPER" webui-standin >"$LOG_DIR/webui-standin.log" 2>&1 &
 WEBUI_PID=$!
-if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
+if [[ "${VERANTYX_LOOPBACK_ONLY:-0}" == 1 ]]; then
+    echo "Encoder starting in loopback-only mode (log: $LOG_DIR/hardware-encoder.log); wait for listener ready on [::1]:9999; Bonjour and peer-to-peer disabled"
+elif [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     echo "Encoder started with ALVR (log: $LOG_DIR/hardware-encoder.log); open an ALVR client app (20.x) on this network"
 else
     echo "Encoder started (log: $LOG_DIR/hardware-encoder.log); open the Vision Pro app to connect"

@@ -828,7 +828,7 @@ int main(int argc, char **argv, char **envp) {
     vx_d3d9_init();
     vx_vcruntime_init();
     vx_extras_init();                            // (last: the tables above come first)
-    if (getenv("VXRT_CONTROL")) vx_control_start(getenv("VXRT_CONTROL"));
+    if (!getenv("VXRT_CONTROL_DIAG") && getenv("VXRT_CONTROL")) vx_control_start(getenv("VXRT_CONTROL"));
 
     // vxrt --list-exports: every function the runtime implements, "dll<TAB>name" per line (tools/vxrt_doctor.py
     // compares a game's imports with it, without running the game).
@@ -860,6 +860,7 @@ int main(int argc, char **argv, char **envp) {
     static char *exe;
     exe = realpath(argv[1], NULL);
     if (!exe) { vx_log("cannot open %s: %s", argv[1], strerror(errno)); return 1; }
+    vx_control_metadata_start(exe);
     make_process_parameters(exe);
     snprintf(g_exe_dir, sizeof g_exe_dir, "%s", exe);
     *strrchr(g_exe_dir, '/') = 0;

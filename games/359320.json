@@ -1,0 +1,66 @@
+{
+  "$schema": "./profile.schema.json",
+  "appid": "359320",
+  "key": "elite",
+  "name": "Elite Dangerous",
+  "launcher": "game",
+  "engine": "vxrt",
+  "exe": "Products/elite-dangerous-odyssey-64/EliteDangerous64.exe",
+  "default_scenario": "keyboard-diagnostic",
+  "scenarios": {
+    "keyboard-diagnostic": {
+      "args": [],
+      "seconds": 60,
+      "input": "keyboard_mouse",
+      "note": "Startup/authentication diagnostic for the installed Odyssey executable, with simulated head pose and no simulated controllers. No credentials or authentication arguments supplied. Stop at authentication failure; this does not validate VR mode, physical keyboard/mouse, or AVP playback."
+    }
+  },
+  "status": {
+    "state": "partial",
+    "summary": {
+      "en": "Connects to SteamVR and survives the 60-second diagnostic; the final frame is still the SteamVR waiting background. ED rendering, authentication and keyboard/mouse input are unverified.",
+      "ja": "SteamVR接続と60秒の診断継続を確認。最終画像は待機背景で、ゲーム描画・認証・入力は未確認。"
+    },
+    "checked": "2026-10-18",
+    "machine": "Apple M4 Max"
+  },
+  "baselines": {},
+  "known_issues": [
+    {
+      "summary": "Official launcher/authentication handoff and VR activation are unverified; do not fabricate tickets, copy tokens, or bypass authentication."
+    },
+    {
+      "summary": "Anti-cheat status remains unknown; absence of filename matches is not proof of absence. Stop on explicit evidence."
+    },
+    {
+      "summary": "WinHTTP proxy configuration and IP Helper routing queries currently return explicit unsupported errors; their causal role in the network initialization failure is unverified. No proxy, route, authentication or ownership success is fabricated.",
+      "since": "2026-10-18"
+    },
+    {
+      "summary": "The user explicitly waived the known intermittent D3D12 zero timestamp check blocker for continued diagnostics. It remains unresolved; no assertion was weakened and no stable full-check pass is claimed.",
+      "since": "2026-10-18"
+    },
+    {
+      "summary": "20261018T174219Z-elite-keyboard-diagnostic o2=21.3/d3=true confirms the ED Scene connection; o14=0, o16={}, o18=null and d4=true. Its automatic controls level/d5 reflects legacy binding files, not working keyboard/mouse. o11-o13 final image is the SteamVR waiting background; o4/o6 compositor/stream frame rates are not ED rendering rates. No application Submit/Present evidence or authentication result is established.",
+      "since": "2026-10-18"
+    }
+  ],
+  "notes": [
+    "The profile selects the installed Odyssey product explicitly; it does not install, update or alter game configuration.",
+    "Isolated harness roots do not make the original install or host filesystem read-only.",
+    "No real keyboard/mouse input, headset behavior, or playable status has been verified.",
+    "20261018T104853Z-elite-keyboard-diagnostic o14/o16 stopped at SetCriticalSectionSpinCount; after implementation, 20261018T105428Z-elite-keyboard-diagnostic o14/o16 advanced to _get_heap_handle. Both d3 false. No authentication or VR activation claim.",
+    "20261018T151528Z-elite-keyboard-diagnostic o14/o16 advanced past _get_heap_handle to MiniDumpWriteDump, secondary to a null call in the game log. 20261018T151851Z-elite-keyboard-diagnostic o12/o16 exposed that original null exception after truthful dump failure handling.",
+    "20261018T152216Z-elite-keyboard-diagnostic o14/o16 reached wcsncpy after NtSetInformationThread became a uniform STATUS_NOT_IMPLEMENTED entry; it does not implement debugger hiding or claim full Windows semantics.",
+    "20261018T152437Z, 20261018T152703Z, 20261018T152904Z and 20261018T153033Z elite-keyboard-diagnostic runs o14/o16 successively reached _wtof, WinHttpGetDefaultProxyConfiguration, WinHttpGetIEProxyConfigForCurrentUser and strerror_s.",
+    "20261018T153317Z-elite-keyboard-diagnostic o12/o16 showed a C SEH unwind ABI mismatch. After the calling convention fix and dedicated regression, 20261018T153835Z-elite-keyboard-diagnostic o12=0 and o14/o16 reached GetBestRoute.",
+    "20261018T154035Z-elite-keyboard-diagnostic level=starts only. o6=59.7 streamed fps and o13=0.237 brightness describe the SteamVR waiting environment shown in frame_end.png, not ED rendering or gameplay. Network dialog remained; d4 is not proof of scenario activity or playability.",
+    "Network diagnosis uses only explicit --network-diagnostic: VXRT_NET_DIAG=1, fixed API allowlist and 128 records per process, no argument payloads. Run 20261018T164533Z-elite-keyboard-diagnostic recorded 69 game-process entries; GetBestRoute failure has a fallback and is not established as the cause. No adapter/proxy/route success was fabricated.",
+    "The adapter implementation uses real host snapshots and documented bounded compatibility mappings; its source classification, lease handling and packing are tested. This does not implement WinHTTP proxy discovery or GetBestRoute. Incomplete run directory 20261018T171514Z-elite-keyboard-diagnostic has no sealed result: a stream-metric aggregation IndexError was fixed and independently regressed before the valid 171632Z run.",
+    "20261018T172914Z-elite-keyboard-diagnostic: after a real DirectInput8 COM root was implemented, the previous +0x5c9add dereference disappeared. o18 instead records a NULL call from +0x28bccbb, statically identified as missing GetVolumeNameForVolumeMountPointA. Device enumeration still returns explicit unsupported failure; keyboard/mouse input is not implemented or verified.",
+    "20261018T173545Z-elite-keyboard-diagnostic: after the ANSI volume API received the same explicit failure contract as the existing wide API, o14=0 and o16/o18 stop at OpenWaitableTimerA (line105); d3/d4=false. No volume GUID or named timer success is fabricated.",
+    "20261018T173844Z-elite-keyboard-diagnostic o16/o18 reached SearchPathW after OpenWaitableTimerA received explicit unsupported failure. The bounded explicit-path SearchPathW implementation preceded 174219Z, the first measured ED Scene connection. Default search policy and named timer opening remain unsupported; no successful behavior is fabricated.",
+    "20261018T175514Z-elite-keyboard-diagnostic o2=12.8/d3=true and o20 records exactly three successful metadata-only samples at 30/40/50 seconds: one visible enabled non-minimized window in the selected ED main process. No titles, text or class names were read. This does not classify authentication/error content or prove application frame submission.",
+    "20261018T181508Z-elite-keyboard-diagnostic o2=13.0/d3=true; o21 at 30/40/50 seconds shows main commit and drawable Present fixed at85, callback entered/completed51→71→91, CPU32.060466→43.654352→55.056061 seconds. These are selected-process activity counts, not scene frames or authentication state. Final capture remains the SteamVR waiting environment; OpenVR Submit is not instrumented. No specific failing API is established, so further generic instrumentation was stopped."
+  ]
+}

@@ -671,6 +671,12 @@ static WINAPI HANDLE CreateEventExW(void *sa, const WCHAR *name, DWORD flags, DW
 }
 static WINAPI HANDLE OpenEventA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return open_named(name, OBJ_EVENT); }
 static WINAPI HANDLE OpenEventW(DWORD access, BOOL inherit, const WCHAR *name) { (void)access; (void)inherit; return open_named_w(name, OBJ_EVENT); }
+static WINAPI HANDLE OpenWaitableTimerA(DWORD access, BOOL inherit, const char *name) {
+    (void)access; (void)inherit; (void)name;
+    // system.c timers wrap anonymous events; there is no named timer registry to query.
+    vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */);
+    return NULL;
+}
 static HANDLE create_mutex(BOOL owned, const char *name) {
     vx_object *o = new_object(OBJ_MUTEX);
     if (owned) { o->owner = vx_current_tid(); o->recursion = 1; }
@@ -1156,6 +1162,13 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
 }
 
 // ---- critical sections and SRW locks -------------------------------------------------------------------------------------
+// x64 CRITICAL_SECTION ends with ULONG_PTR SpinCount at +32. Only its low DWORD can be supplied by the API;
+// initialization clears the high half. Use 32-bit atomics because games also put these objects in packed(4) structs.
+static uint32_t *cs_spin(void *cs) { return (uint32_t *)((uint8_t *)cs + 32); }
+static WINAPI DWORD SetCriticalSectionSpinCount(void *cs, DWORD spin) {
+    if (sysconf(_SC_NPROCESSORS_ONLN) == 1) spin = 0;
+    return __atomic_exchange_n(cs_spin(cs), spin, __ATOMIC_RELAXED);
+}
 #ifdef __aarch64__
 // Lock words in the program's memory, so that the vCPU guest takes and releases a free lock itself (translator/
 // guest.c, the same protocol): only a lock that is held makes a call that waits here, on the word. 32-bit words:
@@ -1170,8 +1183,6 @@ enum { UL_COMPARE_AND_WAIT = 1, ULF_WAKE_ALL = 0x100 };
 enum { CS_RECURSION = 12, CS_OWNER = 16, CS_WORD = 24 };
 #define CS_FIELD(cs, off, type) (*(type *)((uint8_t *)(cs) + (off)))
 static WINAPI void InitializeCriticalSection(void *cs) { memset(cs, 0, 40); }
-static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return 1; }
-static WINAPI BOOL InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; InitializeCriticalSection(cs); return 1; }
 static int cs_try(void *cs, uint32_t tid) {
     uint32_t *w = &CS_FIELD(cs, CS_WORD, uint32_t);
     if (__atomic_load_n(w, __ATOMIC_RELAXED) && CS_FIELD(cs, CS_OWNER, uint32_t) == tid) { CS_FIELD(cs, CS_RECURSION, int32_t)++; return 1; }
@@ -1183,7 +1194,9 @@ static int cs_try(void *cs, uint32_t tid) {
 static WINAPI BOOL TryEnterCriticalSection(void *cs) { return cs_try(cs, vx_current_tid()); }
 static WINAPI void EnterCriticalSection(void *cs) {
     uint32_t tid = vx_current_tid(), *w = &CS_FIELD(cs, CS_WORD, uint32_t);
-    for (int spin = 0; spin < 64; spin++) { if (cs_try(cs, tid)) return; __builtin_arm_yield(); }
+    if (cs_try(cs, tid)) return;
+    uint32_t spins = __atomic_load_n(cs_spin(cs), __ATOMIC_RELAXED);
+    for (uint32_t spin = 0; spin < spins; spin++) { __builtin_arm_yield(); if (cs_try(cs, tid)) return; }
     // (taken as 2: others may sleep on it still)
     while (__atomic_exchange_n(w, 2, __ATOMIC_ACQUIRE)) __ulock_wait(UL_COMPARE_AND_WAIT, w, 2, 0);
     CS_FIELD(cs, CS_RECURSION, int32_t) = 1; CS_FIELD(cs, CS_OWNER, uint64_t) = tid;
@@ -1239,9 +1252,13 @@ static pthread_mutex_t *cs_mutex(void *cs) {
     return *slot;
 }
 static WINAPI void InitializeCriticalSection(void *cs) { memset(cs, 0, 40); cs_mutex(cs); }
-static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return 1; }
-static WINAPI BOOL InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; InitializeCriticalSection(cs); return 1; }
-static WINAPI void EnterCriticalSection(void *cs) { pthread_mutex_lock(cs_mutex(cs)); }
+static WINAPI void EnterCriticalSection(void *cs) {
+    pthread_mutex_t *m = cs_mutex(cs);
+    if (!pthread_mutex_trylock(m)) return;
+    uint32_t spins = __atomic_load_n(cs_spin(cs), __ATOMIC_RELAXED);
+    for (uint32_t spin = 0; spin < spins; spin++) { __builtin_ia32_pause(); if (!pthread_mutex_trylock(m)) return; }
+    pthread_mutex_lock(m);
+}
 static WINAPI BOOL TryEnterCriticalSection(void *cs) { return pthread_mutex_trylock(cs_mutex(cs)) == 0; }
 static WINAPI void LeaveCriticalSection(void *cs) { pthread_mutex_unlock(cs_mutex(cs)); }
 static WINAPI void DeleteCriticalSection(void *cs) {
@@ -1265,6 +1282,12 @@ static WINAPI void ReleaseSRWLockShared(void *l) { pthread_rwlock_unlock(srw(l))
 static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) { return pthread_rwlock_trywrlock(srw(l)) == 0; }
 static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return pthread_rwlock_tryrdlock(srw(l)) == 0; }
 #endif
+static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) {
+    InitializeCriticalSection(cs); SetCriticalSectionSpinCount(cs, spin); return 1;
+}
+static WINAPI BOOL InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) {
+    (void)flags; return InitializeCriticalSectionAndSpinCount(cs, spin);
+}
 
 // ---- condition variables ------------------------------------------------------------------------------------------------------
 // A CONDITION_VARIABLE (one pointer) holds a wake counter. A sleeper reads it while still holding its lock, so a
@@ -1722,6 +1745,7 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(GetProcessAffinityMask), VX_EXPORT(SetProcessAffinityMask), VX_EXPORT(SetThreadAffinityMask), VX_EXPORT(OpenProcess),
     VX_EXPORT(CreateEventA), VX_EXPORT(CreateEventW), VX_EXPORT(CreateEventExA), VX_EXPORT(CreateEventExW),
     VX_EXPORT(OpenEventA), VX_EXPORT(OpenEventW), VX_EXPORT(SetEvent), VX_EXPORT(ResetEvent),
+    VX_EXPORT(OpenWaitableTimerA),
     VX_EXPORT(CreateMutexA), VX_EXPORT(CreateMutexW), VX_EXPORT(CreateMutexExW), VX_EXPORT(OpenMutexA), VX_EXPORT(OpenMutexW),
     VX_EXPORT(ReleaseMutex),
     VX_EXPORT(CreateSemaphoreA), VX_EXPORT(CreateSemaphoreW), VX_EXPORT(CreateSemaphoreExW), VX_EXPORT(OpenSemaphoreA),
@@ -1733,7 +1757,7 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(WaitOnAddress), VX_EXPORT(WakeByAddressAll), VX_EXPORT(WakeByAddressSingle),
     VX_EXPORT(WaitForSingleObject), VX_EXPORT(WaitForSingleObjectEx), VX_EXPORT(WaitForMultipleObjects),
     VX_EXPORT(WaitForMultipleObjectsEx), VX_EXPORT(SleepEx), VX_EXPORT(QueueUserAPC), VX_EXPORT(CloseHandle), VX_EXPORT(DuplicateHandle),
-    VX_EXPORT(InitializeCriticalSection), VX_EXPORT(InitializeCriticalSectionAndSpinCount), VX_EXPORT(InitializeCriticalSectionEx),
+    VX_EXPORT(InitializeCriticalSection), VX_EXPORT(InitializeCriticalSectionAndSpinCount), VX_EXPORT(InitializeCriticalSectionEx), VX_EXPORT(SetCriticalSectionSpinCount),
     VX_EXPORT(EnterCriticalSection), VX_EXPORT(TryEnterCriticalSection), VX_EXPORT(LeaveCriticalSection), VX_EXPORT(DeleteCriticalSection),
     VX_EXPORT(InitializeSRWLock), VX_EXPORT(AcquireSRWLockExclusive), VX_EXPORT(ReleaseSRWLockExclusive),
     VX_EXPORT(AcquireSRWLockShared), VX_EXPORT(ReleaseSRWLockShared),

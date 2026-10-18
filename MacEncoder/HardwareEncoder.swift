@@ -9,6 +9,13 @@ import Metal
 
 import simd
 
+// The simulated headset uses IPv6 loopback; never expose its unauthenticated transport to the LAN.
+let loopbackOnly = ProcessInfo.processInfo.environment["VERANTYX_LOOPBACK_ONLY"] == "1"
+if loopbackOnly && ProcessInfo.processInfo.environment["VERANTYX_ALVR"] == "1" {
+    print("VERANTYX_LOOPBACK_ONLY=1 cannot be used with VERANTYX_ALVR=1")
+    exit(1)
+}
+
 // MARK: - IPC and UDP Structures
 
 struct SharedFrame {
@@ -1172,11 +1179,16 @@ DispatchQueue.global(qos: .userInteractive).async {
     bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     bindAddr.sin_family = sa_family_t(AF_INET)
     bindAddr.sin_port = in_port_t(11002).bigEndian
-    bindAddr.sin_addr.s_addr = INADDR_ANY
+    bindAddr.sin_addr.s_addr = loopbackOnly ? inet_addr("127.0.0.1") : INADDR_ANY
     
-    bind(jcSock, withUnsafePointer(to: &bindAddr) {
+    let bindResult = bind(jcSock, withUnsafePointer(to: &bindAddr) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
     }, socklen_t(MemoryLayout<sockaddr_in>.size))
+    guard bindResult == 0 else {
+        print("Could not bind Joy-Con UDP port 11002: \(errno)")
+        close(jcSock)
+        return
+    }
     
     var buffer = [UInt8](repeating: 0, count: 2048)
     while true {
@@ -1346,18 +1358,30 @@ func receiveFromVideoPeer(_ connection: NWConnection) {
 }
 
 let networkParameters = NWParameters.udp
-networkParameters.includePeerToPeer = true
+networkParameters.includePeerToPeer = !loopbackOnly
+if loopbackOnly {
+    networkParameters.requiredLocalEndpoint = .hostPort(host: .ipv6(.loopback), port: 9999)
+    networkParameters.requiredInterfaceType = .loopback
+}
 let videoListener: NWListener
 do {
-    videoListener = try NWListener(using: networkParameters, on: 9999)
+    // requiredLocalEndpoint already supplies the port; passing on: as well fails with EINVAL.
+    videoListener = loopbackOnly ? try NWListener(using: networkParameters)
+                                : try NWListener(using: networkParameters, on: 9999)
 } catch {
     print("Could not listen for Vision Pro on port 9999: \(error)")
     exit(1)
 }
-videoListener.service = NWListener.Service(name: "VerantyxVR", type: "_verantyxvr._udp")
+if !loopbackOnly {
+    videoListener.service = NWListener.Service(name: "VerantyxVR", type: "_verantyxvr._udp")
+}
 videoListener.stateUpdateHandler = { state in
     if case .ready = state {
-        print("Published Bonjour _verantyxvr._udp on 9999 using peer-to-peer Network.framework")
+        if loopbackOnly {
+            print("Loopback-only video listener ready on [::1]:9999; Bonjour and peer-to-peer disabled")
+        } else {
+            print("Published Bonjour _verantyxvr._udp on 9999 using peer-to-peer Network.framework")
+        }
     } else if case .failed(let error) = state {
         print("Vision Pro listener failed: \(error)")
         exit(1)

@@ -1,16 +1,16 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
-SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/context.S src/text.c src/files.c src/registry.c \
+SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/iphlp.c src/steambridge.c src/calltrace.c src/netdiag.c src/renderdiag.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/dinput.c src/context.S src/text.c src/files.c src/registry.c \
           src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d12.m src/dxil.c src/dxil_msl.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
+build/vxrt: src/renderdiag.h $(SRC) src/iphlp.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework SystemConfiguration -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
 
 # The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
 # engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
@@ -27,13 +27,34 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
-	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework Hypervisor build/libvxrt_vm.dylib build/guest.o
+build/vxrt-arm64: src/renderdiag.h src/iphlp.h $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework SystemConfiguration -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework Hypervisor build/libvxrt_vm.dylib build/guest.o
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
-tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/breakpoint.exe \
-       build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
+tests: build/search_path.exe build/open_timer.exe build/volume_mount.exe build/dinput_create.exe build/netdiag_api.exe build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/breakpoint.exe build/minidump.exe build/nt_thread_info.exe \
+       build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe build/winhttp_proxy.exe build/c_seh.exe build/best_route.exe \
        build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
+
+build/netdiag_api.exe: tests/netdiag_api.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lws2_32 -liphlpapi -lwinhttp
+
+build/netdiag_host: tests/netdiag_host.c src/netdiag.c src/vx.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/netdiag_host.c src/netdiag.c
+
+build/netdiag_messagebox: tests/netdiag_messagebox.c src/user32.c src/netdiag.c src/vx.h src/ui.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -ffunction-sections -Wl,-dead_strip -Isrc -o $@ tests/netdiag_messagebox.c src/netdiag.c
+
+netdiag-check: build/netdiag_host build/netdiag_messagebox build/netdiag_api.exe $(VXRT)
+	env -u VXRT_NET_DIAG build/netdiag_host
+	VXRT_NET_DIAG=0 build/netdiag_host
+	VXRT_NET_DIAG=01 build/netdiag_host
+	VXRT_NET_DIAG=true build/netdiag_host
+	VXRT_NET_DIAG=1 build/netdiag_host
+	VXRT_NET_DIAG=1 build/netdiag_messagebox
+	sh tests/netdiag_check.sh $(VXRT)
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -59,6 +80,22 @@ build/hw_exceptions.exe: tests/hw_exceptions.c
 build/breakpoint.exe: tests/breakpoint.c
 	@mkdir -p build
 	$(MINGW) -O1 -static -o $@ $<
+
+build/minidump.exe: tests/minidump.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/nt_thread_info.exe: tests/nt_thread_info.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/winhttp_proxy.exe: tests/winhttp_proxy.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/best_route.exe: tests/best_route.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
 
 build/cxx_exceptions.exe: tests/cxx_exceptions.cpp
 	@mkdir -p build
@@ -99,6 +136,12 @@ build/msvc_eh.exe: tests/msvc_eh.cpp tests/msvc/start.c build/libvcruntime140.a
 	$(MSVCCC) -c tests/msvc_eh.cpp -o build/msvc_eh.obj
 	$(MSVCCC) -c tests/msvc/start.c -o build/msvc_start.obj
 	$(MINGW) -nostdlib -e mainCRTStartup -o $@ build/msvc_eh.obj build/msvc_start.obj -Lbuild -lvcruntime140 -lkernel32 -lucrtbase
+
+build/c_seh.exe: tests/c_seh.c tests/msvc/start.c
+	@mkdir -p build
+	$(MSVCCC) -c tests/c_seh.c -o build/c_seh.obj
+	$(MSVCCC) -c tests/msvc/start.c -o build/c_seh_start.obj
+	$(MINGW) -nostdlib -e mainCRTStartup -o $@ build/c_seh.obj build/c_seh_start.obj -lucrtbase -lkernel32
 
 build/com.exe: tests/com.c
 	@mkdir -p build
@@ -316,6 +359,8 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	build/dxil2msl tests/shaders12/*.dxil
 	build/dxilrun tests/shaders12
 	build/difftest build/ref_x86 200
+	python3 ../tools/test_vxrt_network_diagnostic.py
+	python3 ../tools/test_vxrt_stream_metrics.py
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -324,6 +369,12 @@ VXRT ?= build/vxrt
 runtime-tests: export VXRT_ROOT = build/root
 runtime-tests: export VXRT_NO_ACTIVATE = 1
 runtime-tests: $(VXRT) tests
+	$(MAKE) netdiag-check VXRT=$(VXRT)
+	$(MAKE) iphlp-check VXRT=$(VXRT)
+	$(MAKE) dinput-check VXRT=$(VXRT)
+	$(MAKE) volume-mount-check VXRT=$(VXRT)
+	$(MAKE) open-timer-check VXRT=$(VXRT)
+	$(MAKE) search-path-check VXRT=$(VXRT)
 	$(VXRT) build/hello_k32.exe
 	$(VXRT) build/smc.exe
 	$(VXRT) build/hello_crt.exe one "two words"
@@ -331,14 +382,20 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/cxx_exceptions.exe
 	$(VXRT) build/hw_exceptions.exe
 	$(VXRT) build/breakpoint.exe
+	$(VXRT) build/minidump.exe
+	$(VXRT) build/nt_thread_info.exe
+	$(VXRT) build/winhttp_proxy.exe
+	$(VXRT) build/best_route.exe
 	$(VXRT) build/lowmem.exe
 	$(VXRT) build/files.exe
+	python3 tests/overlay_rename.py $(VXRT) build/files.exe
 	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
 	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow $(VXRT) build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
 	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
 	$(VXRT) build/dll_test.exe
 	$(VXRT) build/net.exe
 	$(VXRT) build/msvc_eh.exe
+	$(VXRT) build/c_seh.exe
 	$(VXRT) build/com.exe
 	$(VXRT) build/iocp.exe
 	$(VXRT) build/window.exe
@@ -360,6 +417,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/shared.exe pingpong 1 & $(VXRT) build/shared.exe pingpong 2; wait
 
 check-arm64: build/vxrt-arm64 tests
+	python3 ../tools/test_vxrt_network_diagnostic.py
 	$(MAKE) runtime-tests VXRT=build/vxrt-arm64
 
 # CPU cost per Direct3D 11 draw (numbers only, not a test).
@@ -372,3 +430,65 @@ clean:
 	rm -rf build
 
 .PHONY: vr-check all tests check bench clean shaders translator-check
+
+# Adapter fixtures use synthetic addresses; host/PE checks print counts only.
+build/iphlp_host: tests/iphlp_host.c src/iphlp.c src/iphlp.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/iphlp_host.c -framework SystemConfiguration -framework CoreFoundation
+
+build/iphlp_api.exe: tests/iphlp_api.c
+	$(MINGW) -O1 -o $@ $< -liphlpapi -lws2_32
+
+iphlp-check: build/iphlp_host build/iphlp_api.exe $(VXRT)
+	build/iphlp_host
+	$(VXRT) build/iphlp_api.exe
+
+build/dinput_create.exe: tests/dinput_create.c
+	$(MINGW) -O1 -o $@ $< -ldinput8 -ldxguid
+
+dinput-check: build/dinput_create.exe $(VXRT)
+	$(VXRT) build/dinput_create.exe
+
+.PHONY: volume-mount-check
+build/volume_mount.exe: tests/volume_mount.c
+	$(MINGW) -O1 -o $@ $<
+
+volume-mount-check: build/volume_mount.exe $(VXRT)
+	$(VXRT) build/volume_mount.exe
+
+.PHONY: open-timer-check
+build/open_timer.exe: tests/open_timer.c
+	$(MINGW) -O1 -o $@ $<
+
+open-timer-check: build/open_timer.exe $(VXRT)
+	$(VXRT) build/open_timer.exe
+
+.PHONY: search-path-check
+build/search_path.exe: tests/search_path.c
+	$(MINGW) -O1 -o $@ $<
+
+search-path-check: build/search_path.exe $(VXRT)
+	mkdir -p build/searchpath-root/drive_c/tree/中文 build/searchpath-root/drive_c/second build/searchpath-root/drive_c/denied build/searchpath-root/drive_c/tree/blocked build/searchpath-shadow/blocked
+	touch build/searchpath-root/drive_c/tree/中文/数据.bin build/searchpath-root/drive_c/tree/choice.txt build/searchpath-root/drive_c/second/choice.txt build/searchpath-shadow/shadow.txt build/searchpath-root/drive_c/tree/blocked/choice.txt
+	chmod 000 build/searchpath-root/drive_c/denied build/searchpath-shadow/blocked
+	@trap 'chmod 700 build/searchpath-root/drive_c/denied build/searchpath-shadow/blocked' EXIT; VXRT_ROOT="$(CURDIR)/build/searchpath-root" VXRT_OVERLAY="$(CURDIR)/build/searchpath-root/drive_c/tree:$(CURDIR)/build/searchpath-shadow" VXRT_NO_WINE=1 VXRT_NO_ACTIVATE=1 $(VXRT) build/search_path.exe
+
+.PHONY: window-metadata-check
+build/window_metadata.exe: tests/window_metadata.c
+	$(MINGW) -O1 -o $@ $< -luser32
+
+window-metadata-check: build/window_metadata.exe $(VXRT)
+	python3 tests/window_metadata_check.py
+
+.PHONY: render-diagnostic-check
+build/renderdiag_host: tests/renderdiag_host.c src/renderdiag.c src/renderdiag.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+build/render_diagnostic.exe: tests/render_diagnostic.c
+	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luser32
+
+build/activity_diagnostic.exe: tests/activity_diagnostic.c
+	$(MINGW) -O1 -o $@ $< -ld3d11 -luser32
+
+render-diagnostic-check: build/renderdiag_host build/render_diagnostic.exe build/activity_diagnostic.exe $(VXRT)
+	build/renderdiag_host
+	python3 tests/render_diagnostic_check.py

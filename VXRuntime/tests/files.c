@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 static int failures;
 #define CHECK(cond) do { if (!(cond)) { printf("check failed (line %d): %s\n", __LINE__, #cond); failures++; } } while (0)
 
@@ -48,6 +49,17 @@ static int overlay_test(const char *tree) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 5 && (!strcmp(argv[1], "rename") || !strcmp(argv[1], "wrename"))) {
+        int result;
+        if (!strcmp(argv[1], "wrename")) {
+            WCHAR from[4096], to[4096];
+            MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, from, 4096);
+            MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, to, 4096);
+            result = _wrename(from, to);
+        } else result = rename(argv[2], argv[3]);
+        CHECK((result == 0) == !strcmp(argv[4], "ok"));
+        return failures;
+    }
     if (argc > 2 && !strcmp(argv[1], "overlay")) return overlay_test(argv[2]);
     char buf[MAX_PATH];
     DWORD n;
