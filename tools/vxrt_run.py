@@ -16,6 +16,7 @@ it starts, with a typed reason (the user is playing, SteamVR is up, the roots ar
 
 Exit status: 0 pass, 1 fail, 2 no baseline to compare with, 3 refused, 4 error.
 """
+from vxrt_cpu_sample import CpuDiagnostic
 import socket, stat, tempfile
 import argparse, json, math, mmap, os, re, shutil, signal, statistics, struct, subprocess, sys, threading, time, zlib
 from datetime import datetime, timezone
@@ -432,7 +433,7 @@ def git_state():
 
 # Restricted diagnostics use a new protocol, never the text/action Clip client.
 def control_environment(env):
-    return {k: v for k, v in env.items() if not k.startswith("VXRT_CONTROL")}
+    return {k: v for k, v in env.items() if not k.startswith("VXRT_CONTROL") and k != "VXRT_CPU_DIAG"}
 
 RENDER_APIS = ("D3D11CreateDevice", "D3D11CreateDeviceAndSwapChain", "IDXGIFactory.CreateSwapChain",
                "IDXGIFactory2.CreateSwapChainForHwnd", "IDXGISwapChain.Present", "IDXGISwapChain1.Present1")
@@ -469,7 +470,10 @@ def validate_render_counters(value):
 class WindowMetadata:
     schedule = (30, 40, 50)
 
-    def __init__(self, enabled, render=False):
+    def __init__(self, enabled, render=False, cpu=False):
+        self.cpu = CpuDiagnostic(cpu)
+        if cpu and not enabled:
+            raise ValueError("cpu_diagnostic requires window_metadata")
         if type(render) is not bool:
             raise ValueError("render_diagnostic must be a boolean")
         self.window_enabled, self.render_enabled = enabled, render
@@ -490,6 +494,9 @@ class WindowMetadata:
         self.rows = []
 
     def prepare(self, env, target):
+        env.pop("VXRT_CPU_DIAG", None)
+        if self.cpu.enabled:
+            env["VXRT_CPU_DIAG"] = "1"
         if not self.enabled:
             return
         self.directory = tempfile.mkdtemp(prefix="vxclip-", dir="/private/tmp")
@@ -579,6 +586,7 @@ class WindowMetadata:
             row = self.sample()
             row.update(sample_index=index, elapsed_seconds=round(time.monotonic() - started, 3))
             self.rows.append(row)
+            self.cpu.collect(self, row, index)
         for config in (self.config, self.render_config):
             if config["enabled"]:
                 config.update(request_count=len(self.rows), success_count=sum(r["status"] == "ok" for r in self.rows),
@@ -618,8 +626,8 @@ class WindowMetadata:
             config["artifact"] = rel(path)
 
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
-        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False):
-    windows = WindowMetadata(window_metadata, render_diagnostic)
+        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False, cpu_diagnostic=False):
+    windows = WindowMetadata(window_metadata, render_diagnostic, cpu_diagnostic)
     diagnostic = network_diagnostic_config(network_diagnostic)
     safety_env = safety_environment(safety_env)
     key, spec, inst = resolve(game)
@@ -651,6 +659,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     result["network_diagnostic"] = diagnostic
     result["window_diagnostic"] = windows.config
     result["render_diagnostic"] = windows.render_config
+    result["cpu_diagnostic"] = windows.cpu.config
     result["input_mode"] = input_mode
     result["safety_environment"] = dict({"VXRT_MUTE": "1", "VERANTYX_AUDIO": "0"}, **safety_env)
     checks = preconditions(spec, inst, args, root, overlay, need_steam)
@@ -790,6 +799,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     ev.observe("first_problem", facts["first_problem"], game_log)
     ev.observe("exit", facts["exit"], game_log)
     windows.seal(run_dir, ev)  # appended: existing observation IDs retain their positions
+    windows.cpu.seal(run_dir, ev)
 
     base_name, base, base_src = baseline_for(key, scenario, quality)
     result["baseline"] = base_src
@@ -850,6 +860,7 @@ def main():
     ap.add_argument("--press-every", type=float, default=15.0, help="pull the right trigger every N seconds (0: never)")
     ap.add_argument("--root"); ap.add_argument("--overlay")
     ap.add_argument("--trace", action="store_true", help="VXRT_TRACE=1 (slower: more in the log)")
+    ap.add_argument("--cpu-diagnostic", action="store_true", help="one 2 s CPU PC window; requires --window-metadata; no stacks or thread names")
     ap.add_argument("--render-diagnostic", action="store_true", help="three fixed D3D11/DXGI counter snapshots in the selected main process; no textures or OpenVR hooks")
     ap.add_argument("--window-metadata", action="store_true", help="three read-only window metadata samples; no text or input")
     ap.add_argument("--network-diagnostic", action="store_true", help="fixed network API diagnostic: returns/errors and caller offsets, at most 128 records per process, no argument payloads")
@@ -884,7 +895,7 @@ def main():
                 scenario, _, quality = name.partition("@")
                 r = run(key, scenario, quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam,
                         settings=dict(kv.split("=", 1) for kv in a.set), safety_env=dict(kv.split("=", 1) for kv in a.safety_env),
-                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic)
+                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic)
                 code = {"pass": 0, "fail": 1, "no_baseline": 2, "refused": 3}.get(r["status"], 4)
                 if code == 3: sys.exit(3)                      # (refused: the rest would be too)
                 worst = max(worst, code)
@@ -899,7 +910,7 @@ def main():
     try:
         r = run(a.game, a.scenario, a.quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam, quiet=a.json,
                 settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream,
-                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic)
+                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic)
     except Exception as e:                                    # (an error in the harness itself, not a game's)
         print(f"vxrt run: error: {e}", file=sys.stderr); sys.exit(4)
     if a.json:

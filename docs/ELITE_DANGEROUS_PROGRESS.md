@@ -51,13 +51,34 @@ ARM64 full-suite, other-game `vr-check`, and real AVP playtests have not been co
 Adapter UBSan fixtures passed; ASan did not complete. Some diagnostic branches remain unexercised. OpenVR Submit
 is not instrumented; we do not infer its absence from missing logs or a background capture.
 
+## Bounded CPU investigation
+
+The system `sample` approach did not recover a known busy-loop hotspot reliably in the Rosetta fixture, so it was
+not applied to ED. A separate default-off PC-only diagnostic passed the fixture gate and focused privacy, identity,
+limit and conflict tests. It takes one two-second window, with a 20 ms CPU timer and at most 128 retained samples.
+It records fixed module identifiers and relative PCs only: no stack, thread names, window text or request payloads.
+This uses process-wide SIGPROF/ITIMER_PROF resources, rejects existing conflicts, and retains an inactive handler
+until exit to handle late signals. Concurrent changes by other native libraries remain a limitation.
+
+`20261018T214714Z-elite-keyboard-diagnostic` connected after 12.0 seconds (`o2`). The first CPU window completed in
+2011 ms with 116 samples (`o22`), but only one mapped to the main image; 115 remained unknown. This is insufficient
+to locate the black screen and does not mean the process was idle. Sample weights are not all-thread CPU percentages.
+The fixed module allowlist follow-up, `20261018T215239Z-elite-keyboard-diagnostic`, connected after 12.9 seconds
+(`o2`, `d3`). Its 2001 ms window retained 114 samples, all mapped: 112 in the system kernel library and two in the
+main image (`o22`). Without stacks, this does not identify the callers, waiting objects or black-screen cause.
+Present/work commits remained at 87 while callbacks and CPU time increased (`o21`). OpenVR Submit remains unknown.
+
+The final focused tests, including module mapping and clock-failure cleanup, passed. The initial CPU version passed
+full `make check`; the final allowlist version encountered the known D3D12 second-timestamp failure. This remains
+an explicit test exception, not a passing final full suite or a black-screen fix.
+
 ## Next work
 
-Locate the black screen's concrete cause with a short, target-specific CPU stack observation. Keep only bounded,
-sanitized module-relative locations and fixed states; do not capture window text, credentials, textures or full
-process reports. A transparent real OpenVR Submit observation point has not yet been established, so that remains
+Locate a specific failure from the bounded CPU evidence before changing rendering behavior. The next investigation
+needs caller/wait-object evidence rather than interpreting kernel-library samples as CPU percentages or a deadlock.
+A transparent real OpenVR Submit observation point has not yet been established, so that remains
 unknown rather than introducing a behavior-changing proxy. Only implement a further compatibility fix once the
 evidence identifies a specific failure.
 
-This investigation is timeboxed: start wrapping up at 21:58 UTC and stop by 22:03 UTC on 2026-10-18. Unverified
-experiments stay uncommitted; update this page with verified milestones and the next resumption point.
+Work stopped for the agreed break before the 22:03 UTC deadline on 2026-10-18. Test processes and listeners were
+cleaned up; no further run is scheduled. Resume from the evidence above, not from an assumed rendering or login fix.

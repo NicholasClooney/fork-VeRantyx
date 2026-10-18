@@ -1,14 +1,14 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
-SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/iphlp.c src/steambridge.c src/calltrace.c src/netdiag.c src/renderdiag.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/dinput.c src/context.S src/text.c src/files.c src/registry.c \
+SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/iphlp.c src/steambridge.c src/calltrace.c src/netdiag.c src/renderdiag.c src/cpudiag.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/dinput.c src/context.S src/text.c src/files.c src/registry.c \
           src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d12.m src/dxil.c src/dxil_msl.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: src/renderdiag.h $(SRC) src/iphlp.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
+build/vxrt: src/cpudiag.h src/renderdiag.h $(SRC) src/iphlp.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework SystemConfiguration -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
 
@@ -361,6 +361,7 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	build/difftest build/ref_x86 200
 	python3 ../tools/test_vxrt_network_diagnostic.py
 	python3 ../tools/test_vxrt_stream_metrics.py
+	$(MAKE) cpu-diagnostic-check
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -492,3 +493,17 @@ build/activity_diagnostic.exe: tests/activity_diagnostic.c
 render-diagnostic-check: build/renderdiag_host build/render_diagnostic.exe build/activity_diagnostic.exe $(VXRT)
 	build/renderdiag_host
 	python3 tests/render_diagnostic_check.py
+
+build/cpudiag_host: tests/cpudiag_host.c src/cpudiag.c src/cpudiag.h src/vx.h
+	$(CC) $(CFLAGS) -DCPUDIAG_TEST -Isrc -o $@ tests/cpudiag_host.c src/cpudiag.c
+
+build/cpudiag_guest.exe: tests/cpudiag_guest.c
+	$(MINGW) -O1 -o $@ $<
+
+.PHONY: cpu-diagnostic-check
+cpu-diagnostic-check: build/cpudiag_host build/cpudiag_clock_failure build/cpudiag_guest.exe build/vxrt
+	build/cpudiag_clock_failure
+	python3 ../tools/test_vxrt_cpu_sample.py
+
+build/cpudiag_clock_failure: tests/cpudiag_host.c src/cpudiag.c src/cpudiag.h src/vx.h
+	$(CC) $(CFLAGS) -DCPUDIAG_TEST -DCPUDIAG_TEST_CLOCK_FAILURE -Isrc -o $@ tests/cpudiag_host.c src/cpudiag.c

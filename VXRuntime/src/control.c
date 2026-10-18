@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include "ui.h"
 #include "renderdiag.h"
+#include "cpudiag.h"
 
 static char g_path[104];
 static FILE *g_log;
@@ -167,8 +168,10 @@ void vx_control_start(const char *path) {
 static char g_meta_path[104];
 static dev_t g_meta_dev;
 static ino_t g_meta_ino;
+static int g_cpu_mode;
 static int g_meta_mode; // 1 windows, 2 render, 3 both
 static char *diagnostic_snapshot(void) {
+    vx_cpudiag_start();
     char *windows = g_meta_mode != 2 ? vx_ui_metadata() : NULL;
     if (g_meta_mode == 1) return windows;
     char *render = vx_renderdiag_snapshot();
@@ -178,6 +181,13 @@ static char *diagnostic_snapshot(void) {
         else snprintf(out, 4096, "{\"schema_version\":1,\"status\":\"ok\",\"pid\":%d,\"render\":%s}", (int)getpid(), render);
     } else { free(out); out = NULL; }
     free(windows); free(render);
+    return out;
+}
+static char *cpu_snapshot(void) {
+    char *cpu = vx_cpudiag_snapshot(), *out = calloc(1, 4096);
+    if (cpu && out) snprintf(out, 4096, "{\"status\":\"ok\",\"pid\":%d,\"cpu\":%s}", (int)getpid(), cpu);
+    else { free(out); out = NULL; }
+    free(cpu);
     return out;
 }
 static void metadata_cleanup(void) {
@@ -197,7 +207,7 @@ static int metadata_ready(int fd, short events, double deadline) {
 }
 static void *metadata_serve(void *arg) {
     int ls = (int)(intptr_t)arg;
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; attempt < (g_cpu_mode ? 4u : 3u); ++attempt) {
         int fd;
         do { fd = accept(ls, NULL, NULL); } while (fd < 0 && errno == EINTR);
         if (fd < 0) break;
@@ -212,7 +222,8 @@ static void *metadata_serve(void *arg) {
             if (command[n++] == '\n') { complete = 1; break; }
         }
         command[n] = 0;
-        char *state = complete && !strcmp(command, "metadata\n") ? diagnostic_snapshot() : NULL;
+        char *state = complete && !strcmp(command, "metadata\n") ? diagnostic_snapshot() :
+                      complete && g_cpu_mode && !strcmp(command, "cpu\n") ? cpu_snapshot() : NULL;
         const char *response = state ? state : "{\"status\":\"rejected\"}";
         char wire[4096]; int len = snprintf(wire, sizeof wire, "%s\n", response);
         free(state);
@@ -262,6 +273,8 @@ void vx_control_metadata_start(const char *exe) {
     if (chmod(path, 0600) || listen(ls, 3)) { close(ls); metadata_cleanup(); return; }
     atexit(metadata_cleanup);
     g_meta_mode = selected;
+    g_cpu_mode = getenv("VXRT_CPU_DIAG") && !strcmp(getenv("VXRT_CPU_DIAG"), "1");
+    if (g_cpu_mode) vx_cpudiag_enable();
     if (selected & 2) vx_renderdiag_enable();
     pthread_t thread;
     if (pthread_create(&thread, NULL, metadata_serve, (void *)(intptr_t)ls)) {
