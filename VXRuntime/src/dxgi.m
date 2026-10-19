@@ -1,3 +1,4 @@
+#include "waitdiag.h"
 #include "renderdiag.h"
 // DXGI on Metal: the factory, the adapter (the Mac's GPU), its output (the main display), and swap chains.
 //
@@ -424,11 +425,14 @@ static WINAPI HRESULT swapchain_present_impl(void *this, uint32_t sync, uint32_t
     swapchain *sc = this;
     if (flags & DXGI_PRESENT_TEST) { vx_renderdiag_stage(RD_TEST); return S_OK; }
     d3d_flush(sc->dev, 0);                          // the frame's work goes first, on the same queue
+    vx_waitdiag_phase("present_snapshot");
     snapshot(sc);
     CAMetalLayer *layer = (__bridge CAMetalLayer *)sc->layer;
     layer.displaySyncEnabled = sync != 0;
     @autoreleasepool {
+        vx_waitdiag_phase("next_drawable");
         id<CAMetalDrawable> drawable = [layer nextDrawable];
+        vx_waitdiag_phase("present_encode");
         if (!drawable) { vx_renderdiag_stage(RD_NO_DRAWABLE); return S_OK; }                 // hidden or minimized: nothing to show
         id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
         id<MTLTexture> back = (__bridge id<MTLTexture>)sc->buffer->mtl;
@@ -442,6 +446,7 @@ static WINAPI HRESULT swapchain_present_impl(void *this, uint32_t sync, uint32_t
         [enc setFragmentTexture:back atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
+        vx_waitdiag_phase("present_commit");
         [cmd presentDrawable:drawable];
         [cmd commit];
     }
@@ -450,17 +455,23 @@ static WINAPI HRESULT swapchain_present_impl(void *this, uint32_t sync, uint32_t
     return S_OK;
 }
 static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flags) {
+    VX_WAITDIAG_SCOPE("DXGI.Present", this, 0);
+    vx_waitdiag_present();
     unsigned ticket = vx_renderdiag_begin(RD_PRESENT);
     HRESULT hr = swapchain_present_impl(this, sync, flags);
     vx_renderdiag_end(RD_PRESENT, ticket, hr);
+    vx_waitdiag_result(&wd_scope, hr);
     return hr;
 }
 
 static WINAPI HRESULT swapchain_present1_impl(void *this, uint32_t sync, uint32_t flags, const void *params) { (void)params; return swapchain_present(this, sync, flags); }
 static WINAPI HRESULT swapchain_present1(void *this, uint32_t sync, uint32_t flags, const void *params) {
+    VX_WAITDIAG_SCOPE("DXGI.Present1", this, 0);
+    vx_waitdiag_present();
     unsigned ticket = vx_renderdiag_begin(RD_PRESENT1);
     HRESULT hr = swapchain_present1_impl(this, sync, flags, params);
     vx_renderdiag_end(RD_PRESENT1, ticket, hr);
+    vx_waitdiag_result(&wd_scope, hr);
     return hr;
 }
 

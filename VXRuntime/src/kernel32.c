@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <mach-o/dyld.h>
 #include "vx.h"
+#include "waitdiag.h"
 
 #define STD_INPUT_HANDLE  ((DWORD)-10)
 #define STD_OUTPUT_HANDLE ((DWORD)-11)
@@ -475,7 +476,11 @@ static WINAPI DWORD GetTimeZoneInformation(TIME_ZONE_INFORMATION *tz) {
     return 0;                                       // TIME_ZONE_ID_UNKNOWN
 }
 
-static WINAPI void Sleep(DWORD ms) { if (ms) usleep((useconds_t)ms * 1000); else sched_yield(); }
+static WINAPI void Sleep(DWORD ms) {
+    VX_WAITDIAG_SCOPE("Sleep", 0, ms);
+    vx_waitdiag_phase("sleep_or_yield");
+    if (ms) usleep((useconds_t)ms * 1000); else sched_yield();
+}
 static WINAPI BOOL QueryPerformanceFrequency(int64_t *f) { *f = 1000000000; return 1; }
 static WINAPI BOOL QueryPerformanceCounter(int64_t *c) {
     static mach_timebase_info_data_t tb;

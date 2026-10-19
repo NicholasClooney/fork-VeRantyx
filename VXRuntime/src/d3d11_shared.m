@@ -1,3 +1,4 @@
+#include "waitdiag.h"
 // Direct3D 11 resources shared between processes (D3D11_RESOURCE_MISC_SHARED, _SHARED_KEYEDMUTEX, _SHARED_NTHANDLE).
 //
 // Every shared resource has a slot in a table in shared memory that all vxrt processes of one C: root see; its
@@ -260,9 +261,10 @@ static void keyed_stats(int why, const struct timespec *start) {
            (unsigned long long)(ns[2] / 1000000), (unsigned long long)waits[3], (unsigned long long)(ns[3] / 1000000));
 }
 static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
+    VX_WAITDIAG_SCOPE("DXGI.AcquireSync", this, ms);
     if (g_keyed_stats < 0) g_keyed_stats = getenv("VXRT_STATS") != NULL;
     d3d_texture *t = keyed_of(this);
-    if (!t->shared) return S_OK;
+    if (!t->shared) return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
     shared_slot *e = &table()->s[t->shared - 1];
     struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
     int why = 0;                                       // what the first look found missing: 1 the GPU, 2 the key, 3 the owner
@@ -288,7 +290,7 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
                 vx_log("keyed mutex slot %d: AcquireSync(%llu) by %d, from%s", t->shared - 1, (unsigned long long)key, (int)getpid(), from);
                 vx_keyed_held++; g_held_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             }
-            return S_OK;
+            return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
         }
         if (!why) why = owned || !gpu_ready ? 1 : (uint64_t)e->key != key ? 2 : 3;
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
@@ -301,12 +303,13 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
             }
             if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: AcquireSync(%llu, %u ms) timed out: released with key %lld, owner %d",
                                                    t->shared - 1, (unsigned long long)key, (unsigned)ms, (long long)e->key, (int)e->owner);
-            return (HRESULT)0x102;   // WAIT_TIMEOUT
+            return (vx_waitdiag_result(&wd_scope, (HRESULT)0x102), (HRESULT)0x102);   // WAIT_TIMEOUT
         }
         // Sleep until a release (any process) or 2 ms, then look again.
         uint32_t seen = __atomic_load_n(&e->released, __ATOMIC_ACQUIRE);
         int gpu_now = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == (int32_t)getpid();
         if (owned ? gpu_now : (uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && !__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE)) continue;
+        vx_waitdiag_phase(owned ? "keyed_gpu_wait" : "keyed_release_wait");
         if (__builtin_available(macOS 14.4, *))
             os_sync_wait_on_address_with_timeout((void *)&e->released, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME, 2000000);
         else usleep(200);

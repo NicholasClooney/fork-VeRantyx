@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include "ui.h"
 #include "renderdiag.h"
+#include "waitdiag.h"
 #include "cpudiag.h"
 
 static char g_path[104];
@@ -169,6 +170,7 @@ static char g_meta_path[104];
 static dev_t g_meta_dev;
 static ino_t g_meta_ino;
 static int g_cpu_mode;
+static int g_wait_mode;
 static int g_meta_mode; // 1 windows, 2 render, 3 both
 static char *diagnostic_snapshot(void) {
     vx_cpudiag_start();
@@ -190,6 +192,15 @@ static char *cpu_snapshot(void) {
     free(cpu);
     return out;
 }
+static char *wait_snapshot(void) {
+    char *wait = vx_waitdiag_snapshot(), *out = calloc(1, 131072);
+    if (wait && out) {
+        int n = snprintf(out, 131072, "{\"schema_version\":1,\"status\":\"ok\",\"pid\":%d,\"wait\":%s}", (int)getpid(), wait);
+        if (n < 0 || n >= 131071) { free(out); out = NULL; }
+    } else { free(out); out = NULL; }
+    free(wait);
+    return out;
+}
 static void metadata_cleanup(void) {
     struct stat st;
     if (g_meta_path[0] && !lstat(g_meta_path, &st) && S_ISSOCK(st.st_mode) &&
@@ -207,7 +218,8 @@ static int metadata_ready(int fd, short events, double deadline) {
 }
 static void *metadata_serve(void *arg) {
     int ls = (int)(intptr_t)arg;
-    for (unsigned attempt = 0; attempt < (g_cpu_mode ? 4u : 3u); ++attempt) {
+    unsigned metadata_count = 0, cpu_count = 0, wait_count = 0;
+    for (unsigned attempt = 0; attempt < (3u + (g_cpu_mode ? 1u : 0u) + (g_wait_mode ? 3u : 0u)); ++attempt) {
         int fd;
         do { fd = accept(ls, NULL, NULL); } while (fd < 0 && errno == EINTR);
         if (fd < 0) break;
@@ -222,10 +234,11 @@ static void *metadata_serve(void *arg) {
             if (command[n++] == '\n') { complete = 1; break; }
         }
         command[n] = 0;
-        char *state = complete && !strcmp(command, "metadata\n") ? diagnostic_snapshot() :
-                      complete && g_cpu_mode && !strcmp(command, "cpu\n") ? cpu_snapshot() : NULL;
+        char *state = complete && !strcmp(command, "metadata\n") && metadata_count++ < 3 ? diagnostic_snapshot() :
+                      complete && g_cpu_mode && !strcmp(command, "cpu\n") && cpu_count++ < 1 ? cpu_snapshot() :
+                      complete && g_wait_mode && !strcmp(command, "wait_snapshot\n") && wait_count++ < 3 ? wait_snapshot() : NULL;
         const char *response = state ? state : "{\"status\":\"rejected\"}";
-        char wire[4096]; int len = snprintf(wire, sizeof wire, "%s\n", response);
+        char wire[131072]; int len = snprintf(wire, sizeof wire, "%s\n", response);
         free(state);
         size_t sent = 0;
         while (len > 0 && (size_t)len < sizeof wire && sent < (size_t)len && metadata_ready(fd, POLLOUT, deadline)) {
@@ -276,6 +289,8 @@ void vx_control_metadata_start(const char *exe) {
     g_cpu_mode = getenv("VXRT_CPU_DIAG") && !strcmp(getenv("VXRT_CPU_DIAG"), "1");
     if (g_cpu_mode) vx_cpudiag_enable();
     if (selected & 2) vx_renderdiag_enable();
+    g_wait_mode = getenv("VXRT_WAIT_DIAG") && !strcmp(getenv("VXRT_WAIT_DIAG"), "1");
+    if (g_wait_mode) vx_waitdiag_enable();
     pthread_t thread;
     if (pthread_create(&thread, NULL, metadata_serve, (void *)(intptr_t)ls)) {
         close(ls); metadata_cleanup(); return;

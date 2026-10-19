@@ -400,6 +400,30 @@ def validate(result):
             p = os.path.join(REPO, o["artifact"])
             if not os.path.exists(p) or ledger.sha256_file(p) != o["sha256"]:
                 problems.append(f"observation {o['id']} ({o['metric']}): {o['artifact']} changed or gone")
+    for o in obs.values():
+        if o.get("metric") != "wait_diagnostic_samples":
+            continue
+        rows = o.get("value")
+        if not valid_wait_samples(rows):
+            problems.append("wait_diagnostic_samples: invalid bounded schema")
+        try:
+            with open(os.path.join(REPO, o["artifact"])) as f:
+                saved = [json.loads(line) for line in f]
+            config = result.get("wait_diagnostic", {})
+            if (saved != rows or config.get("artifact") != o["artifact"] or config.get("sha256") != o.get("sha256")
+                or config.get("enabled") is not True or config.get("mode") != "wait_snapshot"
+                or config.get("max_samples") != 3 or config.get("schedule_seconds") != [30, 40, 50]
+                or config.get("max_response_bytes") != 131072 or config.get("text_capture") is not False
+                or config.get("read_only") is not True or config.get("child_excluded") is not True
+                or config.get("target_selector") != "exact_realpath_main_process"
+                or config.get("request_count") != len(saved)
+                or config.get("success_count") != sum(row.get("status") == "ok" for row in saved)):
+                problems.append("wait_diagnostic_samples: artifact/config mismatch")
+            hashes = config.get("source_hashes", {})
+            if set(hashes) != set(WAIT_SOURCES) or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v) for v in hashes.values()):
+                problems.append("wait_diagnostic_samples: missing source hashes")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            problems.append("wait_diagnostic_samples: missing or invalid artifact")
     # Recorded values against what they come from: a median against its samples, the samples against the file.
     for o in obs.values():
         if o["metric"] == "fps_median" and o.get("samples") is not None:
@@ -433,7 +457,7 @@ def git_state():
 
 # Restricted diagnostics use a new protocol, never the text/action Clip client.
 def control_environment(env):
-    return {k: v for k, v in env.items() if not k.startswith("VXRT_CONTROL") and k != "VXRT_CPU_DIAG"}
+    return {k: v for k, v in env.items() if not k.startswith("VXRT_CONTROL") and k not in ("VXRT_CPU_DIAG", "VXRT_WAIT_DIAG")}
 
 RENDER_APIS = ("D3D11CreateDevice", "D3D11CreateDeviceAndSwapChain", "IDXGIFactory.CreateSwapChain",
                "IDXGIFactory2.CreateSwapChainForHwnd", "IDXGISwapChain.Present", "IDXGISwapChain1.Present1")
@@ -467,17 +491,99 @@ def validate_render_counters(value):
                 apis=apis, process_cpu_valid=valid, process_cpu_ns=cpu,
                 **{k: value[k] for k in RENDER_STAGES + RENDER_ACTIVITY})
 
+WAIT_APIS = ("AcquireSRWLockExclusive", "AcquireSRWLockShared", "D3D11.Flush", "D3D11.GetData", "D3D11.Map",
+             "DXGI.AcquireSync", "DXGI.Present", "DXGI.Present1", "EnterCriticalSection",
+             "GetQueuedCompletionStatus", "GetQueuedCompletionStatusEx", "LeaveCriticalSection",
+             "ReleaseSRWLockExclusive", "ReleaseSRWLockShared", "ResetEvent", "SetEvent", "Sleep",
+             "SleepConditionVariableCS", "SleepConditionVariableSRW", "SleepEx", "SwitchToThread",
+             "TryAcquireSRWLockExclusive", "TryAcquireSRWLockShared", "TryEnterCriticalSection",
+             "WaitForMultipleObjects", "WaitForMultipleObjectsEx", "WaitForSingleObject",
+             "WaitForSingleObjectEx", "WaitOnAddress", "WakeAllConditionVariable", "WakeByAddressAll",
+             "WakeByAddressSingle", "WakeConditionVariable", "d3d11.d3d_flush", "d3d11.wait_gpu")
+WAIT_PHASES = ("address_compare_wait", "address_queue_lock", "autorelease_pool", "completed",
+               "completion_port_check", "completion_port_lock", "completion_port_wait", "condition_queue_lock",
+               "condition_reacquire", "condition_wait", "critical_section_mutex_wait", "entered",
+               "event_modify", "fence_commit", "flush_commit", "flush_work", "gpu_command_wait",
+               "gpu_fence_wait", "gpu_sequence_wait", "keyed_gpu_wait", "keyed_release_wait", "next_drawable",
+               "objects_check", "objects_condition_wait", "objects_lock", "objects_shared_address_wait",
+               "objects_shared_poll_wait", "present_commit", "present_encode", "present_snapshot",
+               "recent_lock", "sleep_or_yield", "srw_exclusive_wait", "srw_shared_wait", "yield")
+WAIT_MODULES = ("unknown", "main_image", "runtime", "vrclient_x64", "openvr_api", "msvcr100",
+                "msvcp100", "ucrtbase", "vcruntime140", "msvcp140")
+WAIT_SOURCES = ("tools/vxrt_run.py", "VXRuntime/src/control.c", "VXRuntime/src/waitdiag.c",
+                "VXRuntime/src/waitdiag.h", "VXRuntime/src/sync.c", "VXRuntime/src/kernel32.c",
+                "VXRuntime/src/desktop.c", "VXRuntime/src/dxgi.m", "VXRuntime/src/d3d11.m",
+                "VXRuntime/src/d3d11_draw.m", "VXRuntime/src/d3d11_shared.m")
+
+def validate_wait_snapshot(value):
+    """Project only bounded scalars and code-owned labels; never persist guest strings."""
+    uint = lambda n, maximum=2**64-1: type(n) is int and 0 <= n <= maximum
+    if (not isinstance(value, dict) or value.get("status") not in ("off", "active", "conflict", "unsupported_arch")
+        or value.get("scope") != "selected_process_including_loaded_dlls"
+        or value.get("openvr_submit") != "not_instrumented"
+        or value.get("object_identity") != "address_or_handle_not_lifetime"
+        or type(value.get("max_threads")) is not int or value["max_threads"] != 64
+        or type(value.get("max_depth")) is not int or value["max_depth"] != 8
+        or type(value.get("overflow")) is not bool or not uint(value.get("last_present_thread"), 64)
+        or not isinstance(value.get("threads"), list) or len(value["threads"]) > 64):
+        return None
+    threads, seen = [], set()
+    for row in value["threads"]:
+        if (not isinstance(row, dict) or not uint(row.get("thread"), 64) or row["thread"] == 0
+            or row["thread"] in seen or any(not uint(row.get(k)) for k in ("entered", "completed"))
+            or type(row.get("active")) is not bool or type(row.get("truncated")) is not bool
+            or not isinstance(row.get("frames"), list) or len(row["frames"]) > 8):
+            return None
+        seen.add(row["thread"])
+        frames = []
+        for frame in row["frames"]:
+            if (not isinstance(frame, dict) or frame.get("api") not in WAIT_APIS
+                or frame.get("phase") not in WAIT_PHASES or frame.get("caller_module") not in WAIT_MODULES
+                or not uint(frame.get("object"), 256)
+                or any(not uint(frame.get(k)) for k in ("caller_offset", "started_ns"))
+                or "result" not in frame or (frame["result"] is not None and
+                    (type(frame["result"]) is not int or not -2**63 <= frame["result"] < 2**63))):
+                return None
+            frames.append({k: frame[k] for k in ("api", "phase", "object", "caller_module", "caller_offset", "started_ns", "result")})
+        threads.append(dict({k: row[k] for k in ("thread", "entered", "completed", "active", "truncated")}, frames=frames))
+    return dict({k: value[k] for k in ("status", "scope", "openvr_submit", "object_identity", "max_threads",
+                                      "max_depth", "overflow", "last_present_thread")}, threads=threads)
+
+def valid_wait_samples(rows):
+    if not isinstance(rows, list) or len(rows) > 3:
+        return False
+    for index, row in enumerate(rows, 1):
+        if (not isinstance(row, dict) or type(row.get("sample_index")) is not int or row["sample_index"] != index
+            or type(row.get("elapsed_seconds")) not in (int, float)
+            or not math.isfinite(row["elapsed_seconds"]) or row["elapsed_seconds"] < 0):
+            return False
+        keys = {"status", "sample_index", "elapsed_seconds"}
+        if row.get("status") == "ok":
+            keys |= {"pid", "wait"}
+            if (type(row.get("pid")) is not int or row["pid"] <= 0
+                or validate_wait_snapshot(row.get("wait")) is None
+                or validate_wait_snapshot(row["wait"]) != row["wait"]):
+                return False
+        elif row.get("status") not in ("identity_mismatch", "unavailable", "invalid_response", "timeout"):
+            return False
+        if set(row) != keys:
+            return False
+    return True
+
 class WindowMetadata:
     schedule = (30, 40, 50)
 
-    def __init__(self, enabled, render=False, cpu=False):
+    def __init__(self, enabled, render=False, cpu=False, wait=False):
         self.cpu = CpuDiagnostic(cpu)
         if cpu and not enabled:
             raise ValueError("cpu_diagnostic requires window_metadata")
         if type(render) is not bool:
             raise ValueError("render_diagnostic must be a boolean")
         self.window_enabled, self.render_enabled = enabled, render
-        self.enabled = enabled or render
+        self.enabled = enabled or render or wait
+        if type(wait) is not bool:
+            raise ValueError("wait_diagnostic must be a boolean")
+        self.wait_enabled = wait
         if type(enabled) is not bool:
             raise ValueError("window_metadata must be a boolean")
         self.config = {"enabled": enabled, "mode": "metadata_only" if enabled else "off",
@@ -489,11 +595,20 @@ class WindowMetadata:
                                   max_samples=3 if render else 0, schedule_seconds=list(self.schedule) if render else [],
                                   scope="selected_process_including_loaded_dlls", openvr_submit="not_instrumented",
                                   status="not_started" if render else "off")
+        self.wait_config = dict(self.render_config, enabled=wait, mode="wait_snapshot" if wait else "off",
+                                max_samples=3 if wait else 0, schedule_seconds=list(self.schedule) if wait else [],
+                                status="not_started" if wait else "off", max_response_bytes=131072)
+        self.wait_rows = []
         self.directory = self.path = None
         self.socket_identity = self.directory_identity = None
         self.rows = []
 
     def prepare(self, env, target):
+        env.pop("VXRT_WAIT_DIAG", None)
+        if self.wait_enabled:
+            if "VXRT_TRACE_CALLS" in env:
+                raise ValueError("wait_diagnostic conflicts with VXRT_TRACE_CALLS")
+            env["VXRT_WAIT_DIAG"] = "1"
         env.pop("VXRT_CPU_DIAG", None)
         if self.cpu.enabled:
             env["VXRT_CPU_DIAG"] = "1"
@@ -503,10 +618,11 @@ class WindowMetadata:
         self.path = os.path.join(self.directory, "control.sock")
         st = os.lstat(self.directory)
         self.directory_identity = (st.st_dev, st.st_ino)
-        mode = "metadata_render" if self.window_enabled and self.render_enabled else "render" if self.render_enabled else "metadata"
+        mode = ("metadata_render" if self.window_enabled and self.render_enabled else
+                "render" if self.render_enabled or (self.wait_enabled and not self.window_enabled) else "metadata")
         env.update(VXRT_CONTROL_DIAG=mode, VXRT_CONTROL_TARGET=os.path.realpath(target),
                    VXRT_CONTROL_DIAG_SOCKET=self.path)
-        for config in (self.config, self.render_config):
+        for config in (self.config, self.render_config, self.wait_config):
             if config["enabled"]:
                 config["status"] = "prepared"
 
@@ -528,7 +644,7 @@ class WindowMetadata:
         except OSError:
             pass
 
-    def sample(self):
+    def sample(self, wait=False):
         # Never persist arbitrary server fields, even when a stale/malicious endpoint replies.
         counts = ("total_windows", "visible_windows", "enabled_windows", "child_windows", "minimized_windows")
         deadline = time.monotonic() + 2
@@ -545,23 +661,27 @@ class WindowMetadata:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(max(.001, deadline - time.monotonic()))
                 client.connect(self.path)
-                client.sendall(b"metadata\n")
+                client.sendall(b"wait_snapshot\n" if wait else b"metadata\n")
+                limit = 131072 if wait else 4096
                 data = b""
                 while b"\n" not in data:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError()
                     client.settimeout(remaining)
-                    chunk = client.recv(4096 - len(data))
-                    if not chunk or len(data) + len(chunk) >= 4096:
+                    chunk = client.recv(limit - len(data))
+                    if not chunk or len(data) + len(chunk) >= limit:
                         return {"status": "invalid_response"}
                     data += chunk
                 value = json.loads(data.split(b"\n", 1)[0])
-                if (not isinstance(value, dict) or value.get("status") != "ok" or value.get("schema_version") != 1
+                if (not isinstance(value, dict) or value.get("status") != "ok" or type(value.get("schema_version")) is not int or value["schema_version"] != 1
                     or type(value.get("pid")) is not int or value["pid"] <= 0
-                    or (self.window_enabled and any(type(value.get(k)) is not int or not 0 <= value[k] <= 16384 for k in counts))):
+                    or (not wait and self.window_enabled and any(type(value.get(k)) is not int or not 0 <= value[k] <= 16384 for k in counts))):
                     return {"status": "invalid_response"}
                 row = {"status": "ok", "pid": value["pid"]}
+                if wait:
+                    snapshot = validate_wait_snapshot(value.get("wait"))
+                    return dict(row, wait=snapshot) if snapshot is not None else {"status": "invalid_response"}
                 if self.window_enabled:
                     row.update(error_category="unknown", **{k: value[k] for k in counts})
                 if self.render_enabled:
@@ -583,14 +703,21 @@ class WindowMetadata:
             self.remember_socket()
             if stop.is_set():
                 break
+            if self.wait_enabled:
+                wait_row = self.sample(wait=True)
+                wait_row.update(sample_index=index, elapsed_seconds=round(time.monotonic() - started, 3))
+                self.wait_rows.append(wait_row)
+            if not (self.window_enabled or self.render_enabled):
+                continue
             row = self.sample()
             row.update(sample_index=index, elapsed_seconds=round(time.monotonic() - started, 3))
             self.rows.append(row)
             self.cpu.collect(self, row, index)
-        for config in (self.config, self.render_config):
+        for config in (self.config, self.render_config, self.wait_config):
             if config["enabled"]:
-                config.update(request_count=len(self.rows), success_count=sum(r["status"] == "ok" for r in self.rows),
-                              status="completed" if len(self.rows) == 3 else "stopped")
+                rows = self.wait_rows if config is self.wait_config else self.rows
+                config.update(request_count=len(rows), success_count=sum(r["status"] == "ok" for r in rows),
+                              status="completed" if len(rows) == 3 else "stopped")
 
     def cleanup(self):
         # No recursive removal: an unexpected replacement is left alone.
@@ -611,10 +738,13 @@ class WindowMetadata:
                 pass
 
     def seal(self, run_dir, evidence):
-        for config, metric in ((self.config, "window_metadata"), (self.render_config, "render_diagnostic")):
+        for config, metric in ((self.config, "window_metadata"), (self.render_config, "render_diagnostic"),
+                               (self.wait_config, "wait_diagnostic_samples")):
             if not config["enabled"]:
                 continue
-            if metric == "window_metadata":
+            if metric == "wait_diagnostic_samples":
+                rows = self.wait_rows
+            elif metric == "window_metadata":
                 rows = [{k: v for k, v in row.items() if k != "render"} for row in self.rows]
             else:
                 rows = [{k: v for k, v in row.items() if k in ("status", "pid", "sample_index", "elapsed_seconds", "render")} for row in self.rows]
@@ -624,10 +754,16 @@ class WindowMetadata:
                     output.write(json.dumps(row, sort_keys=True) + "\n")
             evidence.observe(metric, rows, path, note="fixed read-only diagnostic; not application frame or authentication evidence")
             config["artifact"] = rel(path)
+            if metric == "wait_diagnostic_samples":
+                config["sha256"] = ledger.sha256_file(path)
+                config["source_hashes"] = {source: ledger.sha256_file(os.path.join(REPO, source))
+                                           for source in WAIT_SOURCES}
 
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
-        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False, cpu_diagnostic=False):
-    windows = WindowMetadata(window_metadata, render_diagnostic, cpu_diagnostic)
+        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False, cpu_diagnostic=False, wait_diagnostic=False):
+    windows = WindowMetadata(window_metadata, render_diagnostic, cpu_diagnostic, wait_diagnostic)
+    if wait_diagnostic and "VXRT_TRACE_CALLS" in os.environ:
+        raise ValueError("wait_diagnostic conflicts with VXRT_TRACE_CALLS")
     diagnostic = network_diagnostic_config(network_diagnostic)
     safety_env = safety_environment(safety_env)
     key, spec, inst = resolve(game)
@@ -660,10 +796,14 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     result["window_diagnostic"] = windows.config
     result["render_diagnostic"] = windows.render_config
     result["cpu_diagnostic"] = windows.cpu.config
+    result["wait_diagnostic"] = windows.wait_config
     result["input_mode"] = input_mode
     result["safety_environment"] = dict({"VXRT_MUTE": "1", "VERANTYX_AUDIO": "0"}, **safety_env)
     checks = preconditions(spec, inst, args, root, overlay, need_steam)
     bad = sorted(set(settings) - TUNABLES)
+    if wait_diagnostic:
+        checks.append({"code": "wait_diagnostic_compatible", "ok": "VXRT_TRACE_CALLS" not in settings,
+                       "detail": "wait snapshots conflict with caller rewriting in VXRT_TRACE_CALLS"})
     checks.append({"code": "settings_allowed", "ok": not bad, "detail": "only AGENTS.md's tunables" if not bad else "not tunable: " + ", ".join(bad)})
     result["preconditions"] = checks
     if sc is None and spec:
@@ -861,6 +1001,7 @@ def main():
     ap.add_argument("--root"); ap.add_argument("--overlay")
     ap.add_argument("--trace", action="store_true", help="VXRT_TRACE=1 (slower: more in the log)")
     ap.add_argument("--cpu-diagnostic", action="store_true", help="one 2 s CPU PC window; requires --window-metadata; no stacks or thread names")
+    ap.add_argument("--wait-diagnostic", action="store_true", help="three bounded wait snapshots in the selected main process; no text payloads")
     ap.add_argument("--render-diagnostic", action="store_true", help="three fixed D3D11/DXGI counter snapshots in the selected main process; no textures or OpenVR hooks")
     ap.add_argument("--window-metadata", action="store_true", help="three read-only window metadata samples; no text or input")
     ap.add_argument("--network-diagnostic", action="store_true", help="fixed network API diagnostic: returns/errors and caller offsets, at most 128 records per process, no argument payloads")
@@ -895,7 +1036,7 @@ def main():
                 scenario, _, quality = name.partition("@")
                 r = run(key, scenario, quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam,
                         settings=dict(kv.split("=", 1) for kv in a.set), safety_env=dict(kv.split("=", 1) for kv in a.safety_env),
-                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic)
+                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic)
                 code = {"pass": 0, "fail": 1, "no_baseline": 2, "refused": 3}.get(r["status"], 4)
                 if code == 3: sys.exit(3)                      # (refused: the rest would be too)
                 worst = max(worst, code)
@@ -910,7 +1051,7 @@ def main():
     try:
         r = run(a.game, a.scenario, a.quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam, quiet=a.json,
                 settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream,
-                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic)
+                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic)
     except Exception as e:                                    # (an error in the harness itself, not a game's)
         print(f"vxrt run: error: {e}", file=sys.stderr); sys.exit(4)
     if a.json:

@@ -82,3 +82,34 @@ evidence identifies a specific failure.
 
 Work stopped for the agreed break before the 22:03 UTC deadline on 2026-10-18. Test processes and listeners were
 cleaned up; no further run is scheduled. Resume from the evidence above, not from an assumed rendering or login fix.
+
+## Wait/caller diagnostic implementation (2026-10-19)
+
+The opt-in `--wait-diagnostic` records three read-only snapshots at 30/40/50 seconds into
+`wait_diagnostic_samples.jsonl`, sealed as the `wait_diagnostic_samples` observation. It records fixed API and
+phase labels, allowlisted module-relative callers, anonymous thread/address-or-handle tokens and entry/normal
+return counters. The last observed Present thread token can be correlated with its current instrumented calls.
+Wait/lock/event/IOCP and D3D11 Map/Flush/GetData/Present/keyed-mutex paths are covered; OpenVR Submit is still
+`not_instrumented`. No Valve code or vtable is patched, and no additional rendering or synchronization is requested.
+
+Limits: at most 64 threads for the process lifetime, eight nested calls per thread and 256 object-address tokens.
+Snapshots retain the active call stack or the last normally completed outer call, not a chronological trace.
+Object tokens do not establish object lifetime across address/handle reuse. Multi-object waits have no object
+list. `active` means entry without an observed normal return, not proof of a live thread, deadlock or CPU use;
+nonlocal SEH/longjmp/thread termination can bypass cleanup. Module attribution uses mappings available at snapshot
+time, so unloaded/reused mappings are not a historical identity guarantee. Native/third-party waits outside the
+covered APIs are unknown. Overflow, token-table contention or snapshot omission explicitly marks incomplete data.
+It is disabled on ARM64 and conflicts with `VXRT_TRACE_CALLS` because that facility rewrites callers. The diagnostic
+adds overhead and is not suitable for performance comparisons with an uninstrumented run.
+
+Implementation and fixture validation do not identify ED's black-screen cause. A new game harness run is pending.
+
+Validation: native core and actual sync-wrapper fixtures passed, seven transport/schema tests passed, and real PE
+fixtures verified an already-entered wait, main-image caller attribution, the last Present thread and D3D11 API
+assertions with diagnostics enabled. A maximum 64-thread/eight-frame snapshot validated at 104740 bytes. Independent
+review identified a suspend-sensitive token-table lock; it now uses trylock and reports unknown/overflow on
+contention, with a regression test. The full `make check` run reached the known waived D3D12 zero second-timestamp
+failure; every original test after that failing command was then run separately and passed. This is not a fully
+passing `make check`. An earlier sandbox run could not access Metal, and the first unsandboxed run missed the CPU
+fixture's 0.2-second startup sample; the unchanged CPU fixture passed in the subsequent full run. ARM64 and game
+harness validation remain pending.

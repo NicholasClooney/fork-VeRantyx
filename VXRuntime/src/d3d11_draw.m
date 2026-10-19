@@ -1,3 +1,4 @@
+#include "waitdiag.h"
 // Direct3D 11 drawing on Metal: shaders (DXBC translated to Metal Shading Language by dxbc.c), input layouts,
 // blend, depth-stencil, rasterizer and sampler states, the context's pipeline bindings, and draw calls.
 //
@@ -2038,19 +2039,20 @@ static WINAPI void ctx_end(void *this, d3d_query *q) {
 }
 #define D3D11_ASYNC_GETDATA_DONOTFLUSH 1
 static WINAPI HRESULT ctx_get_data(void *this, d3d_query *q, void *data, uint32_t size, uint32_t flags) {
+    VX_WAITDIAG_SCOPE("D3D11.GetData", q, 0);
     d3d_context *c = this;
-    if (!q) return E_INVALIDARG;
+    if (!q) return (vx_waitdiag_result(&wd_scope, E_INVALIDARG), E_INVALIDARG);
     if (q->desc[0] == 3) {                                    // disjoint: always ready
         if (data && size >= 16) { uint64_t f = 1000000000ull; memcpy(data, &f, 8); memset((uint8_t *)data + 8, 0, 8); }
-        return S_OK;
+        return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
     }
-    if (!q->ended) return S_FALSE;
+    if (!q->ended) return (vx_waitdiag_result(&wd_scope, S_FALSE), S_FALSE);
     d3d_device *dev = c->base.dev;
     if (__atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) < q->target) {
         if (!(flags & D3D11_ASYNC_GETDATA_DONOTFLUSH) && dev->submitted < q->target) d3d_flush(dev, 0);
-        if (__atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) < q->target) return S_FALSE;
+        if (__atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) < q->target) return (vx_waitdiag_result(&wd_scope, S_FALSE), S_FALSE);
     }
-    if (!data || !size) return S_OK;
+    if (!data || !size) return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
     uint8_t out[88] = { 0 };
     switch (q->desc[0]) {
     case 0: case 5: *(uint32_t *)out = 1; break;
@@ -2064,7 +2066,7 @@ static WINAPI HRESULT ctx_get_data(void *this, d3d_query *q, void *data, uint32_
         *(uint64_t *)out = q->stamp; break;
     }
     memcpy(data, out, MIN(size, query_size(q->desc[0])));
-    return S_OK;
+    return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
 }
 static WINAPI void ctx_set_predication(void *this, void *p, int value) { (void)this; (void)p; (void)value; }   // draws are never skipped
 static WINAPI void ctx_get_predication(void *this, void **p, int *value) { (void)this; if (p) *p = NULL; if (value) *value = 0; }

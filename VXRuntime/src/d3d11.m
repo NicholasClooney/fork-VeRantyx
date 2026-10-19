@@ -1,3 +1,4 @@
+#include "waitdiag.h"
 #include "renderdiag.h"
 // Direct3D 11 on Metal: the device, its resources and views, and the immediate context.
 //
@@ -551,6 +552,7 @@ static uint64_t g_recent_seq[RECENT];
 static d3d_device *g_recent_dev[RECENT];
 static pthread_mutex_t g_recent_lock = PTHREAD_MUTEX_INITIALIZER;
 static HRESULT wait_gpu(d3d_context *c, d3d_object *o, uint32_t flags) {
+    VX_WAITDIAG_SCOPE("d3d11.wait_gpu", o, 0);
     d3d_device *dev = c->base.dev;
     uint64_t seq = o->gpu_seq;
     static int trace = -1;
@@ -563,12 +565,17 @@ static HRESULT wait_gpu(d3d_context *c, d3d_object *o, uint32_t flags) {
     if (!seq || __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) >= seq) return S_OK;
     // The command buffer itself says first when the GPU is done (completion handlers run a little later).
     id<MTLCommandBuffer> cmd = nil;
+    vx_waitdiag_phase("recent_lock");
     pthread_mutex_lock(&g_recent_lock);
     if (g_recent_seq[seq % RECENT] == seq && g_recent_dev[seq % RECENT] == dev && g_recent[seq % RECENT]) cmd = (__bridge id<MTLCommandBuffer>)g_recent[seq % RECENT];
     pthread_mutex_unlock(&g_recent_lock);
-    if (flags & MAP_FLAG_DO_NOT_WAIT)
-        return __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) >= seq || (cmd && cmd.status >= MTLCommandBufferStatusCompleted) ? S_OK : DXGI_ERROR_WAS_STILL_DRAWING;
-    if (cmd) { [cmd waitUntilCompleted]; return S_OK; }
+    if (flags & MAP_FLAG_DO_NOT_WAIT) {
+        HRESULT hr = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) >= seq || (cmd && cmd.status >= MTLCommandBufferStatusCompleted) ? S_OK : DXGI_ERROR_WAS_STILL_DRAWING;
+        vx_waitdiag_result(&wd_scope, hr);
+        return hr;
+    }
+    if (cmd) { vx_waitdiag_phase("gpu_command_wait"); [cmd waitUntilCompleted]; return S_OK; }
+    vx_waitdiag_phase("gpu_sequence_wait");
     for (uint64_t now; (now = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE)) < seq; ) {
         if (__builtin_available(macOS 14.4, *))
             os_sync_wait_on_address_with_timeout((void *)&dev->completed, now, 8, OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, 2000000);
@@ -589,7 +596,10 @@ void objc_autoreleasePoolPop(void *pool);
 static __thread void *t_pool;
 static void flush_work(d3d_device *dev, int wait);
 void d3d_flush(d3d_device *dev, int wait) {
+    VX_WAITDIAG_SCOPE("d3d11.d3d_flush", dev, 0);
+    vx_waitdiag_phase("flush_work");
     flush_work(dev, wait);
+    vx_waitdiag_phase("autorelease_pool");
     if (t_pool) objc_autoreleasePoolPop(t_pool);
     t_pool = objc_autoreleasePoolPush();
 }
@@ -608,7 +618,9 @@ static void flush_work(d3d_device *dev, int wait) {
     if (!c->cmd) {
         if (wait) {                                             // still wait for work committed earlier
             id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
+            vx_waitdiag_phase("fence_commit");
             [fence commit];
+            vx_waitdiag_phase("gpu_fence_wait");
             [fence waitUntilCompleted];
         }
         return;
@@ -629,15 +641,17 @@ static void flush_work(d3d_device *dev, int wait) {
         while (prev < seq && !__atomic_compare_exchange_n(&dev->completed, &prev, seq, 1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
         if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&dev->completed, 8, OS_SYNC_WAKE_BY_ADDRESS_NONE);
     }];
+    vx_waitdiag_phase("flush_commit");
     d3d_gpu_profile_submit(dev, (__bridge void *)cmd);
     [cmd commit];
     vx_renderdiag_activity(RD_WORK_MAIN);
+    vx_waitdiag_phase("recent_lock");
     pthread_mutex_lock(&g_recent_lock);
     void *old = g_recent[seq % RECENT];
     g_recent[seq % RECENT] = (void *)CFBridgingRetain(cmd); g_recent_seq[seq % RECENT] = seq; g_recent_dev[seq % RECENT] = dev;
     pthread_mutex_unlock(&g_recent_lock);
     if (old) CFRelease(old);
-    if (wait) [cmd waitUntilCompleted];
+    if (wait) { vx_waitdiag_phase("gpu_command_wait"); [cmd waitUntilCompleted]; }
 }
 
 static WINAPI HRESULT context_qi(void *this, const GUID *iid, void **out) {
@@ -1104,9 +1118,10 @@ static void map_stats(uint32_t type, uint32_t usage, uint64_t ns) {
            (unsigned long long)by[3][0], (unsigned long long)by[3][1], (unsigned long long)by[3][2], (unsigned long long)by[3][3]);
 }
 static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_t type, uint32_t flags, MAPPED *out) {
+    VX_WAITDIAG_SCOPE("D3D11.Map", res, 0);
     d3d_context *c = this;
     HELD_OP(5);
-    if (!res || !out) return E_INVALIDARG;
+    if (!res || !out) return (vx_waitdiag_result(&wd_scope, E_INVALIDARG), E_INVALIDARG);
     if (res->kind == K_BUFFER) {
         d3d_buffer *buf = (d3d_buffer *)res;
         if (type == 4 && buf->shared) {                          // shared: written in place (other processes hold it)
@@ -1116,24 +1131,24 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             HRESULT hr = buf->desc[1] == 3 ? wait_gpu(c, res, flags) : (d3d_flush(c->base.dev, 1), S_OK);   // staging: copies only
             map_stats(type, buf->desc[1], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
-            if (hr) return hr;
+            if (hr) return (vx_waitdiag_result(&wd_scope, hr), hr);
         }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf->mtl;
         out->data = (uint8_t *)b.contents + buf->off; out->row_pitch = out->depth_pitch = buf->desc[0];
-        return S_OK;
+        return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
     }
     d3d_texture *t = (d3d_texture *)res;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     HRESULT hr = t->desc[TD_USAGE] == 3 ? wait_gpu(c, res, flags) : (d3d_flush(c->base.dev, 1), S_OK);   // staging: copies only
     map_stats(type, t->desc[TD_USAGE] & 3, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
-    if (hr) return hr;
+    if (hr) return (vx_waitdiag_result(&wd_scope, hr), hr);
     id<MTLTexture> tex = (__bridge id<MTLTexture>)t->mtl;
     if (tex.buffer) {                                            // a staging image in a buffer: its own memory
         out->data = (uint8_t *)tex.buffer.contents + tex.bufferOffset;
         out->row_pitch = (uint32_t)tex.bufferBytesPerRow; out->depth_pitch = (uint32_t)(tex.bufferBytesPerRow * tex.height);
-        return S_OK;
+        return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
     }
-    if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return E_INVALIDARG; }
+    if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return (vx_waitdiag_result(&wd_scope, E_INVALIDARG), E_INVALIDARG); }
     uint32_t mip, slice;
     subresource(t, sub, &mip, &slice);
     MTLOrigin o; MTLSize sz;
@@ -1146,7 +1161,7 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
     if (type & MAP_READ || type == 3)
         [tex getBytes:t->cpu bytesPerRow:pitch bytesPerImage:image fromRegion:MTLRegionMake3D(0, 0, 0, sz.width, sz.height, sz.depth) mipmapLevel:mip slice:slice];
     out->data = t->cpu; out->row_pitch = pitch; out->depth_pitch = (uint32_t)image;
-    return S_OK;
+    return (vx_waitdiag_result(&wd_scope, S_OK), S_OK);
 }
 static WINAPI void ctx_unmap(void *this, d3d_object *res, uint32_t sub) {
     (void)this;
@@ -1162,7 +1177,11 @@ static WINAPI void ctx_unmap(void *this, d3d_object *res, uint32_t sub) {
     [(__bridge id<MTLTexture>)t->mtl replaceRegion:MTLRegionMake3D(0, 0, 0, sz.width, sz.height, sz.depth) mipmapLevel:mip slice:slice withBytes:t->cpu
                                        bytesPerRow:pitch bytesPerImage:(NSUInteger)pitch * rows];
 }
-static WINAPI void ctx_flush(void *this) { HELD_OP(6); d3d_flush(((d3d_object *)this)->dev, 0); }
+static WINAPI void ctx_flush(void *this) {
+    VX_WAITDIAG_SCOPE("D3D11.Flush", this, 0);
+    HELD_OP(6);
+    d3d_flush(((d3d_object *)this)->dev, 0);
+}
 static WINAPI void ctx_clear_state(void *this) { ctx_om_set_render_targets(this, 0, NULL, NULL); }
 static WINAPI uint32_t ctx_get_type(void *this) { (void)this; return 0; }       // D3D11_DEVICE_CONTEXT_IMMEDIATE
 static WINAPI uint32_t ctx_get_flags(void *this) { (void)this; return 0; }

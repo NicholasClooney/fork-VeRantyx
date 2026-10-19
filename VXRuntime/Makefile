@@ -1,14 +1,14 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
-SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/iphlp.c src/steambridge.c src/calltrace.c src/netdiag.c src/renderdiag.c src/cpudiag.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/dinput.c src/context.S src/text.c src/files.c src/registry.c \
+SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/iphlp.c src/steambridge.c src/calltrace.c src/netdiag.c src/renderdiag.c src/cpudiag.c src/waitdiag.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/dinput.c src/context.S src/text.c src/files.c src/registry.c \
           src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d12.m src/dxil.c src/dxil_msl.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: src/cpudiag.h src/renderdiag.h $(SRC) src/iphlp.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
+build/vxrt: src/waitdiag.h src/cpudiag.h src/renderdiag.h $(SRC) src/iphlp.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework SystemConfiguration -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
 
@@ -27,7 +27,7 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: src/renderdiag.h src/iphlp.h $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+build/vxrt-arm64: src/waitdiag.h src/renderdiag.h src/iphlp.h $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework SystemConfiguration -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework Hypervisor build/libvxrt_vm.dylib build/guest.o
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
@@ -362,6 +362,7 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	python3 ../tools/test_vxrt_network_diagnostic.py
 	python3 ../tools/test_vxrt_stream_metrics.py
 	$(MAKE) cpu-diagnostic-check
+	$(MAKE) wait-diagnostic-check
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -507,3 +508,20 @@ cpu-diagnostic-check: build/cpudiag_host build/cpudiag_clock_failure build/cpudi
 
 build/cpudiag_clock_failure: tests/cpudiag_host.c src/cpudiag.c src/cpudiag.h src/vx.h
 	$(CC) $(CFLAGS) -DCPUDIAG_TEST -DCPUDIAG_TEST_CLOCK_FAILURE -Isrc -o $@ tests/cpudiag_host.c src/cpudiag.c
+
+.PHONY: wait-diagnostic-check
+build/waitdiag_host: tests/waitdiag_host.c src/waitdiag.c src/waitdiag.h src/vx.h
+	$(CC) $(CFLAGS) -Isrc -o $@ $<
+
+build/waitdiag_sync_host: tests/waitdiag_sync_host.c src/sync.c src/waitdiag.h
+	$(CC) $(CFLAGS) -ffunction-sections -Wl,-dead_strip -o $@ $<
+
+build/waitdiag_guest.exe: tests/waitdiag_guest.c
+	$(MINGW) -O1 -o $@ $<
+
+wait-diagnostic-check: build/waitdiag_host build/waitdiag_sync_host build/waitdiag_guest.exe build/render_diagnostic.exe build/d3d11.exe $(VXRT)
+	build/waitdiag_host
+	build/waitdiag_host conflict
+	build/waitdiag_sync_host
+	python3 tests/wait_diagnostic_check.py
+	python3 tests/waitdiag_live_check.py

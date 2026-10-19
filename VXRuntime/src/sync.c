@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include "vx.h"
+#include "waitdiag.h"
 
 #define INFINITE      0xffffffffu
 #define WAIT_TIMEOUT  0x102u
@@ -519,7 +520,13 @@ static WINAPI LONG SetThreadDescription(HANDLE h, const WCHAR *d) {   // a threa
     if ((intptr_t)h == -2 && d) { char *a = vx_utf8_dup(d); pthread_setname_np(a); free(a); }
     return 0;
 }
-static WINAPI BOOL SwitchToThread(void) { sched_yield(); return 1; }
+static WINAPI BOOL SwitchToThread(void) {
+    VX_WAITDIAG_SCOPE("SwitchToThread", 0, 0);
+    vx_waitdiag_phase("yield");
+    sched_yield();
+    vx_waitdiag_result(&wd_scope, 1);
+    return 1;
+}
 
 static uint64_t cpu_mask(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n >= 64 ? ~0ull : (1ull << n) - 1; }
 static WINAPI BOOL GetProcessAffinityMask(HANDLE p, uint64_t *pm, uint64_t *sm) { (void)p; *pm = *sm = cpu_mask(); return 1; }
@@ -720,7 +727,13 @@ static int set_event(vx_object *o, intptr_t v) {
     o->signaled = (int)v;
     return 0;
 }
-static WINAPI BOOL SetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 1); }
+static WINAPI BOOL SetEvent(HANDLE h) {
+    VX_WAITDIAG_SCOPE("SetEvent", h, 0);
+    vx_waitdiag_phase("event_modify");
+    BOOL wd_result = modify(h, OBJ_EVENT, set_event, 1);
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
 // For threads that are not Windows threads (Core Audio's): signals an event without touching a TEB.
 void vx_set_event(HANDLE h) {
     pthread_mutex_lock(&g_lock);
@@ -728,7 +741,13 @@ void vx_set_event(HANDLE h) {
     if (o && o->type == OBJ_EVENT) { set_event(o, 1); notify(o); }
     pthread_mutex_unlock(&g_lock);
 }
-static WINAPI BOOL ResetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 0); }
+static WINAPI BOOL ResetEvent(HANDLE h) {
+    VX_WAITDIAG_SCOPE("ResetEvent", h, 0);
+    vx_waitdiag_phase("event_modify");
+    BOOL wd_result = modify(h, OBJ_EVENT, set_event, 0);
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
 static int release_mutex(vx_object *o, intptr_t tid) {
     if (o->sh) {
         spin_lock(o->sh);
@@ -822,7 +841,8 @@ static __thread int t_alertable;                    // (set for the length of an
 // wait for that mutex meanwhile), with what was waited for and from where.
 __thread int vx_keyed_held;
 static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
-    if (!vx_keyed_held) return wait_objects(n, hs, all, ms);
+    VX_WAITDIAG_SCOPE("WaitForMultipleObjects", 0, ms);
+    if (!vx_keyed_held) { DWORD wd_result = wait_objects(n, hs, all, ms); vx_waitdiag_result(&wd_scope, wd_result); return wd_result; }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     DWORD r = wait_objects(n, hs, all, ms);
     uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
@@ -844,6 +864,7 @@ static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, 
         vx_log("holding a keyed mutex, waited %.2f ms for %u object(s), first of type %d '%s' (timeout %d), result %u, from%s",
                d / 1e6, (unsigned)n, type, name, (int)ms, (unsigned)r, from);
     }
+    vx_waitdiag_result(&wd_scope, r);
     return r;
 }
 static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
@@ -852,7 +873,9 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     struct timespec deadline;
     if (ms != INFINITE) deadline_after(&deadline, ms);
     vx_object *objs[64];
+    vx_waitdiag_phase("objects_lock");
     pthread_mutex_lock(&g_lock);
+    vx_waitdiag_phase("objects_check");
     int shared = 0;
     for (DWORD i = 0; i < n; i++) {
         objs[i] = lookup(hs[i]);
@@ -894,8 +917,10 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
         if (alert) alert->alert_waiter = w;
         if (!shared) {
             int timed_out = 0;
+            vx_waitdiag_phase("objects_condition_wait");
             if (ms == INFINITE) pthread_cond_wait(&w->cv, &g_lock);
             else timed_out = pthread_cond_timedwait(&w->cv, &g_lock, &deadline) == ETIMEDOUT;
+            vx_waitdiag_phase("objects_check");
             if (alert) alert->alert_waiter = NULL;
             for (DWORD k = 0; k < n; k++) unwatch(objs[k], w);
             if (timed_out) { result = WAIT_TIMEOUT; break; }
@@ -912,9 +937,12 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
                     if (d < (int64_t)left_ns) left_ns = d > 0 ? (uint64_t)d : 1;
                 }
                 pthread_mutex_unlock(&g_lock);
+                vx_waitdiag_phase("objects_shared_address_wait");
                 os_sync_wait_on_address_with_timeout((void *)&objs[0]->sh->seq, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
                                                      OS_CLOCK_MACH_ABSOLUTE_TIME, left_ns);
+                vx_waitdiag_phase("objects_lock");
                 pthread_mutex_lock(&g_lock);
+                vx_waitdiag_phase("objects_check");
                 slept = 1;
             }
         }
@@ -922,7 +950,9 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
             struct timespec slice = now;
             slice.tv_nsec += 1000000;
             if (slice.tv_nsec >= 1000000000) { slice.tv_sec++; slice.tv_nsec -= 1000000000; }
+            vx_waitdiag_phase("objects_shared_poll_wait");
             pthread_cond_timedwait(&w->cv, &g_lock, &slice);
+            vx_waitdiag_phase("objects_check");
         }
         if (alert) alert->alert_waiter = NULL;
         for (DWORD k = 0; k < n; k++) unwatch(objs[k], w);
@@ -964,19 +994,35 @@ static DWORD alertable_wait(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     return r;
 }
 static WINAPI DWORD WaitForMultipleObjectsEx(DWORD n, const HANDLE *hs, BOOL all, DWORD ms, BOOL alertable) {
-    return alertable ? alertable_wait(n, hs, all, ms) : WaitForMultipleObjects(n, hs, all, ms);
+    VX_WAITDIAG_SCOPE("WaitForMultipleObjectsEx", 0, ms);
+    DWORD wd_result = alertable ? alertable_wait(n, hs, all, ms) : WaitForMultipleObjects(n, hs, all, ms);
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
 }
-static WINAPI DWORD WaitForSingleObject(HANDLE h, DWORD ms) { return WaitForMultipleObjects(1, &h, 0, ms); }
+static WINAPI DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
+    VX_WAITDIAG_SCOPE("WaitForSingleObject", h, ms);
+    DWORD wd_result = WaitForMultipleObjects(1, &h, 0, ms);
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
 static WINAPI DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable) {
-    return alertable ? alertable_wait(1, &h, 0, ms) : WaitForMultipleObjects(1, &h, 0, ms);
+    VX_WAITDIAG_SCOPE("WaitForSingleObjectEx", h, ms);
+    DWORD wd_result = alertable ? alertable_wait(1, &h, 0, ms) : WaitForMultipleObjects(1, &h, 0, ms);
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
 }
 static WINAPI DWORD SleepEx(DWORD ms, BOOL alertable) {
+    VX_WAITDIAG_SCOPE("SleepEx", 0, ms);
     if (alertable) {                                // a wait on nothing that APCs end
         HANDLE never = (HANDLE)(intptr_t)-1;        // (the current process: never signalled while it runs)
         DWORD r = alertable_wait(1, &never, 0, ms);
-        return r == WAIT_IO_COMPLETION ? r : 0;
+        DWORD wd_result = r == WAIT_IO_COMPLETION ? r : 0;
+        vx_waitdiag_result(&wd_scope, wd_result);
+        return wd_result;
     }
+    vx_waitdiag_phase("sleep_or_yield");
     if (ms) usleep((useconds_t)ms * 1000); else sched_yield();
+    vx_waitdiag_result(&wd_scope, 0);
     return 0;
 }
 
@@ -1191,8 +1237,14 @@ static int cs_try(void *cs, uint32_t tid) {
     CS_FIELD(cs, CS_RECURSION, int32_t) = 1; CS_FIELD(cs, CS_OWNER, uint64_t) = tid;
     return 1;
 }
-static WINAPI BOOL TryEnterCriticalSection(void *cs) { return cs_try(cs, vx_current_tid()); }
+static WINAPI BOOL TryEnterCriticalSection(void *cs) {
+    VX_WAITDIAG_SCOPE("TryEnterCriticalSection", cs, 0);
+    BOOL wd_result = cs_try(cs, vx_current_tid());
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
 static WINAPI void EnterCriticalSection(void *cs) {
+    VX_WAITDIAG_SCOPE("EnterCriticalSection", cs, 0);
     uint32_t tid = vx_current_tid(), *w = &CS_FIELD(cs, CS_WORD, uint32_t);
     if (cs_try(cs, tid)) return;
     uint32_t spins = __atomic_load_n(cs_spin(cs), __ATOMIC_RELAXED);
@@ -1202,6 +1254,7 @@ static WINAPI void EnterCriticalSection(void *cs) {
     CS_FIELD(cs, CS_RECURSION, int32_t) = 1; CS_FIELD(cs, CS_OWNER, uint64_t) = tid;
 }
 static WINAPI void LeaveCriticalSection(void *cs) {
+    VX_WAITDIAG_SCOPE("LeaveCriticalSection", cs, 0);
     if (--CS_FIELD(cs, CS_RECURSION, int32_t) > 0) return;
     CS_FIELD(cs, CS_OWNER, uint64_t) = 0;
     uint32_t *w = &CS_FIELD(cs, CS_WORD, uint32_t);
@@ -1233,12 +1286,36 @@ static void srw_release(uint32_t *w, int shared) {
     } while (!__atomic_compare_exchange_n(w, &cur, neu, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
     if ((cur & 2) && !neu) __ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL, w, 0);
 }
-static WINAPI void AcquireSRWLockExclusive(void *l) { srw_acquire(l, 0); }
-static WINAPI void ReleaseSRWLockExclusive(void *l) { srw_release(l, 0); }
-static WINAPI void AcquireSRWLockShared(void *l) { srw_acquire(l, 1); }
-static WINAPI void ReleaseSRWLockShared(void *l) { srw_release(l, 1); }
-static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) { return srw_try(l, 0); }
-static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return srw_try(l, 1); }
+static WINAPI void AcquireSRWLockExclusive(void *l) {
+    VX_WAITDIAG_SCOPE("AcquireSRWLockExclusive", l, 0);
+    vx_waitdiag_phase("srw_exclusive_wait");
+    srw_acquire(l, 0);
+}
+static WINAPI void ReleaseSRWLockExclusive(void *l) {
+    VX_WAITDIAG_SCOPE("ReleaseSRWLockExclusive", l, 0);
+    srw_release(l, 0);
+}
+static WINAPI void AcquireSRWLockShared(void *l) {
+    VX_WAITDIAG_SCOPE("AcquireSRWLockShared", l, 0);
+    vx_waitdiag_phase("srw_shared_wait");
+    srw_acquire(l, 1);
+}
+static WINAPI void ReleaseSRWLockShared(void *l) {
+    VX_WAITDIAG_SCOPE("ReleaseSRWLockShared", l, 0);
+    srw_release(l, 1);
+}
+static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) {
+    VX_WAITDIAG_SCOPE("TryAcquireSRWLockExclusive", l, 0);
+    BOOL wd_result = srw_try(l, 0);
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
+static WINAPI BOOL TryAcquireSRWLockShared(void *l) {
+    VX_WAITDIAG_SCOPE("TryAcquireSRWLockShared", l, 0);
+    BOOL wd_result = srw_try(l, 1);
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
 #else
 // A CRITICAL_SECTION (40 bytes, in the program's memory) holds a pointer to a recursive pthread mutex.
 static pthread_mutex_t *cs_mutex(void *cs) {
@@ -1253,14 +1330,24 @@ static pthread_mutex_t *cs_mutex(void *cs) {
 }
 static WINAPI void InitializeCriticalSection(void *cs) { memset(cs, 0, 40); cs_mutex(cs); }
 static WINAPI void EnterCriticalSection(void *cs) {
+    VX_WAITDIAG_SCOPE("EnterCriticalSection", cs, 0);
     pthread_mutex_t *m = cs_mutex(cs);
     if (!pthread_mutex_trylock(m)) return;
     uint32_t spins = __atomic_load_n(cs_spin(cs), __ATOMIC_RELAXED);
     for (uint32_t spin = 0; spin < spins; spin++) { __builtin_ia32_pause(); if (!pthread_mutex_trylock(m)) return; }
+    vx_waitdiag_phase("critical_section_mutex_wait");
     pthread_mutex_lock(m);
 }
-static WINAPI BOOL TryEnterCriticalSection(void *cs) { return pthread_mutex_trylock(cs_mutex(cs)) == 0; }
-static WINAPI void LeaveCriticalSection(void *cs) { pthread_mutex_unlock(cs_mutex(cs)); }
+static WINAPI BOOL TryEnterCriticalSection(void *cs) {
+    VX_WAITDIAG_SCOPE("TryEnterCriticalSection", cs, 0);
+    BOOL wd_result = pthread_mutex_trylock(cs_mutex(cs)) == 0;
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
+static WINAPI void LeaveCriticalSection(void *cs) {
+    VX_WAITDIAG_SCOPE("LeaveCriticalSection", cs, 0);
+    pthread_mutex_unlock(cs_mutex(cs));
+}
 static WINAPI void DeleteCriticalSection(void *cs) {
     pthread_mutex_t **slot = (pthread_mutex_t **)cs;
     if (*slot) { pthread_mutex_destroy(*slot); free(*slot); *slot = NULL; }
@@ -1275,12 +1362,36 @@ static pthread_rwlock_t *srw(void *l) {
     return *slot;
 }
 static WINAPI void InitializeSRWLock(void *l) { *(void **)l = NULL; }
-static WINAPI void AcquireSRWLockExclusive(void *l) { pthread_rwlock_wrlock(srw(l)); }
-static WINAPI void ReleaseSRWLockExclusive(void *l) { pthread_rwlock_unlock(srw(l)); }
-static WINAPI void AcquireSRWLockShared(void *l) { pthread_rwlock_rdlock(srw(l)); }
-static WINAPI void ReleaseSRWLockShared(void *l) { pthread_rwlock_unlock(srw(l)); }
-static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) { return pthread_rwlock_trywrlock(srw(l)) == 0; }
-static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return pthread_rwlock_tryrdlock(srw(l)) == 0; }
+static WINAPI void AcquireSRWLockExclusive(void *l) {
+    VX_WAITDIAG_SCOPE("AcquireSRWLockExclusive", l, 0);
+    vx_waitdiag_phase("srw_exclusive_wait");
+    pthread_rwlock_wrlock(srw(l));
+}
+static WINAPI void ReleaseSRWLockExclusive(void *l) {
+    VX_WAITDIAG_SCOPE("ReleaseSRWLockExclusive", l, 0);
+    pthread_rwlock_unlock(srw(l));
+}
+static WINAPI void AcquireSRWLockShared(void *l) {
+    VX_WAITDIAG_SCOPE("AcquireSRWLockShared", l, 0);
+    vx_waitdiag_phase("srw_shared_wait");
+    pthread_rwlock_rdlock(srw(l));
+}
+static WINAPI void ReleaseSRWLockShared(void *l) {
+    VX_WAITDIAG_SCOPE("ReleaseSRWLockShared", l, 0);
+    pthread_rwlock_unlock(srw(l));
+}
+static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) {
+    VX_WAITDIAG_SCOPE("TryAcquireSRWLockExclusive", l, 0);
+    BOOL wd_result = pthread_rwlock_trywrlock(srw(l)) == 0;
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
+static WINAPI BOOL TryAcquireSRWLockShared(void *l) {
+    VX_WAITDIAG_SCOPE("TryAcquireSRWLockShared", l, 0);
+    BOOL wd_result = pthread_rwlock_tryrdlock(srw(l)) == 0;
+    vx_waitdiag_result(&wd_scope, wd_result);
+    return wd_result;
+}
 #endif
 static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) {
     InitializeCriticalSection(cs); SetCriticalSectionSpinCount(cs, spin); return 1;
@@ -1316,7 +1427,9 @@ static int cv_sleep(uint32_t *cv, uint32_t seen, DWORD ms) {   // (32 bits: the 
     if (ms != INFINITE) deadline_after(&deadline, ms);
     int woken = 1;
     wait_queue *q = queue_of(g_cv_queues, cv);
+    vx_waitdiag_phase("condition_queue_lock");
     pthread_mutex_lock(&q->lock);
+    vx_waitdiag_phase("condition_wait");
     while (__atomic_load_n(cv, __ATOMIC_ACQUIRE) == seen) {
         if (ms == INFINITE) pthread_cond_wait(&q->changed, &q->lock);
         else if (ms == 0 || pthread_cond_timedwait(&q->changed, &q->lock, &deadline) == ETIMEDOUT) { woken = 0; break; }
@@ -1327,21 +1440,29 @@ static int cv_sleep(uint32_t *cv, uint32_t seen, DWORD ms) {   // (32 bits: the 
 }
 static WINAPI void InitializeConditionVariable(uint64_t *cv) { *cv = 0; }
 static WINAPI void WakeAllConditionVariable(uint64_t *cv) {
+    VX_WAITDIAG_SCOPE("WakeAllConditionVariable", cv, 0);
     wait_queue *q = queue_of(g_cv_queues, cv);
     pthread_mutex_lock(&q->lock);
     __atomic_add_fetch((uint32_t *)cv, 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&q->changed);
     pthread_mutex_unlock(&q->lock);
 }
-static WINAPI void WakeConditionVariable(uint64_t *cv) { WakeAllConditionVariable(cv); }
+static WINAPI void WakeConditionVariable(uint64_t *cv) {
+    VX_WAITDIAG_SCOPE("WakeConditionVariable", cv, 0);
+    WakeAllConditionVariable(cv);
+}
 static WINAPI BOOL SleepConditionVariableCS(uint64_t *cv, void *cs, DWORD ms) {
+    VX_WAITDIAG_SCOPE("SleepConditionVariableCS", cv, ms);
     uint32_t seen = __atomic_load_n((uint32_t *)cv, __ATOMIC_ACQUIRE);
     LeaveCriticalSection(cs);
     int woken = cv_sleep((uint32_t *)cv, seen, ms);
+    vx_waitdiag_phase("condition_reacquire");
     EnterCriticalSection(cs);
+    vx_waitdiag_result(&wd_scope, woken);
     return woken;
 }
 static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DWORD flags) {
+    VX_WAITDIAG_SCOPE("SleepConditionVariableSRW", cv, ms);
     int shared = flags & 1;                    // CONDITION_VARIABLE_LOCKMODE_SHARED
     uint32_t seen = __atomic_load_n((uint32_t *)cv, __ATOMIC_ACQUIRE);
 #ifdef __aarch64__
@@ -1350,7 +1471,9 @@ static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DW
     pthread_rwlock_unlock(srw(l));
 #endif
     int woken = cv_sleep((uint32_t *)cv, seen, ms);
+    vx_waitdiag_phase("condition_reacquire");
     if (shared) AcquireSRWLockShared(l); else AcquireSRWLockExclusive(l);
+    vx_waitdiag_result(&wd_scope, woken);
     return woken;
 }
 
@@ -1632,7 +1755,9 @@ static int take_packets(HANDLE port, packet *out, int max, DWORD ms, DWORD *err)
     if (ms != INFINITE) deadline_after(&deadline, ms);
     int n = 0;
     *err = 0;
+    vx_waitdiag_phase("completion_port_lock");
     pthread_mutex_lock(&g_lock);
+    vx_waitdiag_phase("completion_port_check");
     vx_object *o = lookup(port);
     if (!o || o->type != OBJ_PORT) { pthread_mutex_unlock(&g_lock); *err = 6; return 0; }
     o->refs++;                                               // the port stays alive while waited on
@@ -1646,29 +1771,35 @@ static int take_packets(HANDLE port, packet *out, int max, DWORD ms, DWORD *err)
         if (n) break;
         if (o->closed) { *err = 735; break; }               // ERROR_ABANDONED_WAIT_0
         if (ms == 0) { *err = 258; break; }                  // WAIT_TIMEOUT
+        vx_waitdiag_phase("completion_port_wait");
         if (ms == INFINITE) pthread_cond_wait(&g_changed, &g_lock);
         else if (pthread_cond_timedwait(&g_changed, &g_lock, &deadline) == ETIMEDOUT) { *err = 258; break; }
     }
+    vx_waitdiag_phase("completion_port_check");
     unref(o);
     pthread_mutex_unlock(&g_lock);
     return n;
 }
 static WINAPI BOOL GetQueuedCompletionStatus(HANDLE port, DWORD *bytes, uint64_t *key, void **ov, DWORD ms) {
+    VX_WAITDIAG_SCOPE("GetQueuedCompletionStatus", port, ms);
     packet p; DWORD err;
-    if (!take_packets(port, &p, 1, ms, &err)) { *ov = NULL; vx_set_last_error(err); return 0; }
+    if (!take_packets(port, &p, 1, ms, &err)) { *ov = NULL; vx_set_last_error(err); vx_waitdiag_result(&wd_scope, 0); return 0; }
     *bytes = p.bytes; *key = p.key; *ov = p.overlapped;
-    if (p.status) { vx_set_last_error(p.status); return 0; }
+    if (p.status) { vx_set_last_error(p.status); vx_waitdiag_result(&wd_scope, 0); return 0; }
+    vx_waitdiag_result(&wd_scope, 1);
     return 1;
 }
 // OVERLAPPED_ENTRY: completion key, OVERLAPPED, internal, bytes transferred.
 typedef struct { uint64_t key; void *overlapped; uint64_t internal; DWORD bytes; } OVERLAPPED_ENTRY;
 static WINAPI BOOL GetQueuedCompletionStatusEx(HANDLE port, OVERLAPPED_ENTRY *entries, uint32_t count, uint32_t *removed, DWORD ms, BOOL alertable) {
+    VX_WAITDIAG_SCOPE("GetQueuedCompletionStatusEx", port, ms);
     (void)alertable;
     packet ps[64]; DWORD err;
     int n = take_packets(port, ps, count < 64 ? (int)count : 64, ms, &err);
     for (int i = 0; i < n; i++) entries[i] = (OVERLAPPED_ENTRY){ ps[i].key, ps[i].overlapped, ps[i].status, ps[i].bytes };
     *removed = (uint32_t)n;
-    if (!n) { vx_set_last_error(err); return 0; }
+    if (!n) { vx_set_last_error(err); vx_waitdiag_result(&wd_scope, 0); return 0; }
+    vx_waitdiag_result(&wd_scope, 1);
     return 1;
 }
 // Most overlapped operations complete at once here; those still running (pipes) hold STATUS_PENDING in Internal
@@ -1701,26 +1832,35 @@ static WINAPI BOOL CancelIoEx(HANDLE file, void *ov) { (void)file; (void)ov; vx_
 // Waiters sleep while the value at the address still equals the compare value, in the queue of the address (as
 // condition variables); a wake wakes that queue (spurious wakeups are allowed), whose waiters then re-check.
 static WINAPI BOOL WaitOnAddress(volatile void *addr, const void *cmp, size_t size, DWORD ms) {
+    VX_WAITDIAG_SCOPE("WaitOnAddress", addr, ms);
     struct timespec deadline;
     if (ms != INFINITE) deadline_after(&deadline, ms);
     BOOL ok = 1;
     wait_queue *q = queue_of(g_addr_queues, addr);
+    vx_waitdiag_phase("address_queue_lock");
     pthread_mutex_lock(&q->lock);
+    vx_waitdiag_phase("address_compare_wait");
     while (!memcmp((const void *)addr, cmp, size)) {
         if (ms == INFINITE) pthread_cond_wait(&q->changed, &q->lock);
         else if (ms == 0 || pthread_cond_timedwait(&q->changed, &q->lock, &deadline) == ETIMEDOUT) { ok = 0; break; }
     }
     pthread_mutex_unlock(&q->lock);
     if (!ok) vx_set_last_error(1460);
+    vx_waitdiag_result(&wd_scope, ok);
     return ok;
 }
 static WINAPI void WakeByAddressAll(void *addr) {
+    VX_WAITDIAG_SCOPE("WakeByAddressAll", addr, 0);
     wait_queue *q = queue_of(g_addr_queues, addr);
+    vx_waitdiag_phase("address_queue_lock");
     pthread_mutex_lock(&q->lock);
     pthread_cond_broadcast(&q->changed);
     pthread_mutex_unlock(&q->lock);
 }
-static WINAPI void WakeByAddressSingle(void *addr) { WakeByAddressAll(addr); }
+static WINAPI void WakeByAddressSingle(void *addr) {
+    VX_WAITDIAG_SCOPE("WakeByAddressSingle", addr, 0);
+    WakeByAddressAll(addr);
+}
 
 // ---- one-time initialization ----------------------------------------------------------------------------------------------------
 static pthread_mutex_t g_once_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
