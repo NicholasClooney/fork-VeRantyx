@@ -361,8 +361,10 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	build/difftest build/ref_x86 200
 	python3 ../tools/test_vxrt_network_diagnostic.py
 	python3 ../tools/test_vxrt_stream_metrics.py
+	python3 ../tools/test_vxrt_metal_abort.py
 	$(MAKE) cpu-diagnostic-check
 	$(MAKE) wait-diagnostic-check
+	$(MAKE) atomic-texture-check
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -529,3 +531,14 @@ wait-diagnostic-check: build/waitdiag_host build/waitdiag_sync_host build/waitdi
 # Optional native ABI probe; deliberately does not run game or runtime code.
 build/peb_native_probe: tests/peb_native_probe.c
 	$(CC) $(CFLAGS) -pthread -o $@ $<
+
+.PHONY: atomic-texture-check
+build/atomic_texture.exe: tests/atomic_texture.c tests/shaders/atomic_cs.h tests/shaders/append_cs.h
+	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid
+
+build/atomic_texture_metal: tests/atomic_texture_metal.m
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< -framework Foundation -framework Metal
+
+atomic-texture-check: build/atomic_texture.exe build/atomic_texture_metal $(VXRT)
+	MTL_DEBUG_LAYER=1 build/atomic_texture_metal
+	MTL_DEBUG_LAYER=1 VXRT_NO_WINE=1 VXRT_NO_ACTIVATE=1 VXRT_ROOT=build/atomic-texture-root $(VXRT) build/atomic_texture.exe

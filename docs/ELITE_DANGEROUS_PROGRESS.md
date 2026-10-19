@@ -178,3 +178,36 @@ measured again with these diagnostic repairs before attributing a rendering or s
 Validation of these repairs passed the native probe, nine protocol/validation tests, four live/core integration
 tests (including diagnostic-thread exit), and a complete `make -C VXRuntime check`. The earlier intermediate
 check encountered the known D3D12 zero timestamp; the final complete pass does not establish that flake is fixed.
+
+### R32 typeless texture descriptor failure
+
+`20261019T171403Z-elite-keyboard-diagnostic` connected after 60.3 seconds (`o2`, `d3`) but exited before completing
+the scenario (`o1=true`, `d4=false`). No Windows unhandled exception or missing-call termination was recorded
+(`o14=0`, `o16={}`, `o18=null`). Its final capture remains the SteamVR waiting background; the automatic `draws`
+label is not evidence of ED scene rendering. The selected log contains a native Metal texture-descriptor assertion
+at lines 341–343 rejecting `MTLPixelFormatR32Float` with texture-atomic usage. Native unprefixed stderr does not
+independently identify its emitting process; a separate fixture reproduces this invalid runtime descriptor.
+
+The runtime mapped DXGI R32_TYPELESS to a float Metal backing while unconditionally adding atomic usage for its UAV
+binding. R32 typeless UAV backing is now R32Uint, with float/signed/unsigned views preserving the underlying bits;
+atomic usage is requested only when the actual backing format is R32Uint or R32Sint. Typed R32_FLOAT resources
+remain float. Render-target views and shared-resource reopening preserve the same format choice. This targets the
+invalid descriptor rather than changing shader or authentication behavior.
+
+The harness now recognizes the fixed Metal texture-descriptor assertion header as a first problem and appends a
+`native_metal_assertion` observation with log-line and artifact provenance. It excludes helper-prefixed and unrelated
+assertions, retains earlier first problems, and does not count a Metal header as a Windows exception or a captured
+signal. Offline re-parsing locates line 341 in this run; the original sealed result remains unchanged. Launch scripts
+do not explicitly enable Metal validation, and historical inherited Metal validation settings were not recorded,
+so its runtime validation mode is unknown. Longer startup and the newly observed failure do not by themselves
+prove progress caused by the prior diagnostic repair. A game harness rerun is still required.
+
+Focused validation with `MTL_DEBUG_LAYER=1` reproduced an exit-134 abort before the format fix. After the fix,
+typed/typeless float UAV stores read back 1 and 0.2, typed/typeless UINT atomic histograms read back 32/32/32/32
+(including shared-resource reopening), and a float RTV over the typeless UAV cleared to four 0.25 values. Native
+R32Uint/R32Sint backing and compatible float/uint view creation passed; signed atomic execution was not tested.
+The Metal usage getter was not used as proof of atomic capability: on this Mac even integer resources omitted
+that flag from the returned usage value. Actual GPU operations and readback are the evidence.
+
+The integrated change passed all six native-assertion parser tests, the explicit Metal-validation texture fixtures,
+and a complete `make -C VXRuntime check`. Existing game `vr-check` and the next ED harness run are not yet complete.

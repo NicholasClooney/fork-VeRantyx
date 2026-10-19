@@ -158,8 +158,10 @@ HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out) 
         IOSurfaceRef surface = IOSurfaceLookup(e->surface);
         if (!surface) { vx_log("Direct3D: the IOSurface of shared handle %p is gone", h); return E_INVALIDARG; }
         MTLPixelFormat f = d3d_mtl_format(e->desc[TD_FORMAT], NULL);
+        if (e->desc[TD_FORMAT] == 39 && (e->desc[TD_BIND] & 0x80) && !(e->desc[TD_BIND] & 0x40)) f = MTLPixelFormatR32Uint;
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:e->desc[TD_WIDTH] height:e->desc[TD_HEIGHT] mipmapped:NO];
         td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+        if ((e->desc[TD_BIND] & 0x80) && (f == MTLPixelFormatR32Uint || f == MTLPixelFormatR32Sint)) td.usage |= MTLTextureUsageShaderAtomic;
         td.storageMode = MTLStorageModeShared;
         id<MTLTexture> tex = [(__bridge id<MTLDevice>)dev->mtl newTextureWithDescriptor:td iosurface:surface plane:0];
         CFRelease(surface);

@@ -239,6 +239,9 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
         if (desc[TD_FORMAT] == 39) f = MTLPixelFormatDepth32Float;
         else if (desc[TD_FORMAT] == 53) f = MTLPixelFormatDepth16Unorm;
     }
+    // R32 typeless UAVs may be viewed as integer atomics. Metal requires an integer backing for
+    // ShaderAtomic; compatible float views retain the same bits without changing typed FLOAT resources.
+    if (desc[TD_FORMAT] == 39 && (desc[TD_BIND] & BIND_UNORDERED_ACCESS) && !(desc[TD_BIND] & BIND_DEPTH_STENCIL)) f = MTLPixelFormatR32Uint;
     MTLTextureDescriptor *td = [MTLTextureDescriptor new];
     td.pixelFormat = f;
     td.width = desc[TD_WIDTH] ? desc[TD_WIDTH] : 1;
@@ -271,7 +274,7 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     if (desc[TD_BIND] & (BIND_RENDER_TARGET | BIND_DEPTH_STENCIL)) usage |= MTLTextureUsageRenderTarget;
     if (desc[TD_BIND] & BIND_UNORDERED_ACCESS) usage |= MTLTextureUsageShaderWrite;
-    if ((desc[TD_BIND] & BIND_UNORDERED_ACCESS) && (desc[TD_FORMAT] == 39 || desc[TD_FORMAT] == 42 || desc[TD_FORMAT] == 43)) usage |= MTLTextureUsageShaderAtomic;   // R32 (typeless, uint, sint): atomics
+    if ((desc[TD_BIND] & BIND_UNORDERED_ACCESS) && (f == MTLPixelFormatR32Uint || f == MTLPixelFormatR32Sint)) usage |= MTLTextureUsageShaderAtomic;
     // Multisampled and depth targets are made without pixel-format views, which Apple GPUs need to keep a render
     // target losslessly compressed (at 2.5K per eye Half-Life: Alyx's 4x-multisampled targets are written out and read
     // back several times a frame; alternating runs: 27-31 -> 31-35 fps). Their views keep the texture's own format
@@ -659,9 +662,9 @@ static WINAPI HRESULT context_qi(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, known, 4);
 }
 
-// A render target view's texture: the resource's, or (kept in the view) a view of it in the render target view's
-// format when the two differ only in sRGB: a UNORM or typeless texture drawn to through an sRGB view, which
-// Direct3D gamma-encodes on write. Drawing to the texture itself stored linear values (menus came out darker and
+// A render target uses its view's format for sRGB encoding and R32 typeless reinterpretation. In particular,
+// an R32 typeless UAV has integer backing, but a float RTV must still write floating-point values.
+// Drawing to a UNORM texture itself instead of its sRGB view stored linear values (menus came out darker and
 // redder, and dark scenes banded: 8 bits of linear values have few steps in the dark).
 static int srgb_pair(MTLPixelFormat a, MTLPixelFormat b) {
     static const MTLPixelFormat pairs[][2] = { { MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB }, { MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm_sRGB } };
@@ -676,7 +679,8 @@ void *d3d_rtv_texture(d3d_view *v) {
     if (v->mtl_view && v->mtl_src == t->mtl) return v->mtl_view;
     id<MTLTexture> base = (__bridge id<MTLTexture>)t->mtl, use = base;
     MTLPixelFormat want = d3d_mtl_format(v->format, NULL);
-    if (want != base.pixelFormat && srgb_pair(want, base.pixelFormat)) {
+    if (want != base.pixelFormat && (srgb_pair(want, base.pixelFormat) ||
+        (t->desc[TD_FORMAT] == 39 && (want == MTLPixelFormatR32Float || want == MTLPixelFormatR32Uint || want == MTLPixelFormatR32Sint)))) {
         id<MTLTexture> view = [base newTextureViewWithPixelFormat:want];
         if (view) use = view;
     }

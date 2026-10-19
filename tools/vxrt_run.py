@@ -287,13 +287,20 @@ def level(ev):
 
 def game_log_facts(path, exe):
     """Counts from the game's own lines of its log (not SteamVR's processes it started)."""
-    facts = {"unhandled": 0, "signals": 0, "unimplemented": {}, "managed_exceptions": 0, "first_problem": None, "exit": None}
+    facts = {"unhandled": 0, "signals": 0, "unimplemented": {}, "managed_exceptions": 0, "first_problem": None, "exit": None,
+             "native_metal_assertion": None}
     if not path or not os.path.exists(path):
         return facts
     for n, line in enumerate(open(path, errors="replace"), 1):
         other = re.match(r"\[vxrt ([^\]:]+):\d+\]", line)
         if other and other.group(1).lower() != exe.lower():
             continue
+        # Native stderr can lack the runtime prefix. Match only a known assertion header,
+        # not arbitrary assertion text from games or helpers sharing this log.
+        native = line[other.end():].lstrip() if other else line
+        metal_assertion = re.fullmatch(
+            r"(?:\d{2}:\d{2}:\d{2}\.\d+ )?-\[MTLTextureDescriptorInternal validateWithDevice:\]:\d+: "
+            r"failed assertion `Texture Descriptor Validation", native.rstrip())
         problem = None
         if "unhandled exception" in line or "unwind did not reach" in line:
             facts["unhandled"] += 1; problem = line
@@ -307,6 +314,10 @@ def game_log_facts(path, exe):
             if facts["managed_exceptions"] == 1: problem = line
         elif re.search(r"MessageBox: Network error: Unable to initialise network\. Please check your connection\.$", line.rstrip()):
             problem = line
+        elif metal_assertion:
+            problem = line
+            if facts["native_metal_assertion"] is None:
+                facts["native_metal_assertion"] = {"line": n, "kind": "metal_texture_descriptor_validation"}
         m = re.search(r"(ExitProcess\(\d+\) from \S+)", line)
         if m: facts["exit"] = m.group(1)
         if problem and not facts["first_problem"]:
@@ -951,6 +962,8 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     ev.observe("exit", facts["exit"], game_log)
     windows.seal(run_dir, ev)  # appended: existing observation IDs retain their positions
     windows.cpu.seal(run_dir, ev)
+    ev.observe("native_metal_assertion", facts["native_metal_assertion"], game_log,
+               note="first recognized native Metal assertion header; helper-prefixed lines excluded; unprefixed stderr has no process identity; null does not prove absence of a native abort")
 
     base_name, base, base_src = baseline_for(key, scenario, quality)
     result["baseline"] = base_src
