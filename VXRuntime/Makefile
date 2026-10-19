@@ -367,6 +367,7 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	$(MAKE) atomic-texture-check
 	$(MAKE) dxbc-failure-diag-check
 	$(MAKE) high-srv-check
+	$(MAKE) uav-texture-clear-check
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -567,3 +568,11 @@ build/high_srv_translate: tests/high_srv_translate.c src/dxbc.c src/dxbc.h $(HIG
 high-srv-check: build/high_srv.exe build/high_srv_translate $(VXRT)
 	build/high_srv_translate
 	MTL_DEBUG_LAYER=1 VXRT_NO_WINE=1 VXRT_NO_ACTIVATE=1 VXRT_ROOT=build/high-srv-root $(VXRT) build/high_srv.exe
+
+.PHONY: uav-texture-clear-check
+build/uav_texture_clear.exe: tests/uav_texture_clear.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxguid
+
+uav-texture-clear-check: build/uav_texture_clear.exe $(VXRT)
+	MTL_DEBUG_LAYER=1 VXRT_NO_WINE=1 VXRT_NO_ACTIVATE=1 VXRT_ROOT=build/uav-texture-clear-root $(VXRT) build/uav_texture_clear.exe

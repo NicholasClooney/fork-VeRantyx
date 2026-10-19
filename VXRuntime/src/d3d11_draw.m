@@ -7,6 +7,7 @@
 // Draws go into one render pass for as long as the render targets stay the same.
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/stat.h>
+#include <math.h>
 #include "d3d_common.h"
 #include "dxbc.h"
 #pragma clang diagnostic push
@@ -95,7 +96,14 @@ static WINAPI HRESULT cs_qi(void *this, const GUID *iid, void **out) { return qu
 static WINAPI HRESULT gs_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11GeometryShader); }
 static WINAPI HRESULT uav_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11UnorderedAccessView); }
 static WINAPI void uav_get_resource(void *this, void **out) { d3d_view *v = this; d3d_addref(v->resource); *out = v->resource; }
-static WINAPI void uav_get_desc(void *this, uint32_t *out) { d3d_view_get_desc(this, 3, out); }
+static WINAPI void uav_get_desc(void *this, uint32_t *out) {
+    d3d_view *v = this;
+    d3d_view_get_desc(v, 3, out);
+    if (v->resource->kind == K_TEXTURE && ((d3d_texture *)v->resource)->dim == 3) {
+        out[3] = v->first_slice;
+        out[4] = v->dim ? v->slices : ((d3d_texture *)v->resource)->depth;
+    }
+}
 static void uav_destroy(d3d_object *o) {
     d3d_view *v = (d3d_view *)o;
     d3d_view_release_mtl(v);
@@ -226,7 +234,6 @@ static WINAPI HRESULT device_create_uav(void *this, d3d_object *res, const uint3
         if (res->kind == K_BUFFER) { v->first = desc[2]; v->count = desc[3]; v->flags = desc[4]; }
         else if (desc[1] == 2 || desc[1] == 4) v->mip = desc[2];                                   // 1D, 2D
         else if (desc[1] == 3 || desc[1] == 5 || desc[1] == 8) { v->mip = desc[2]; v->first_slice = desc[3]; v->slices = desc[4]; }
-        if (desc[1] == 8) { v->first_slice = 0; v->slices = 1; }                                  // 3D: depth slices stay whole
     }
     if (!out) { d3d_release(&v->base); return S_FALSE; }
     *out = v;
@@ -798,6 +805,7 @@ static id<MTLTexture> shader_texture(d3d_view *v) {
     NSUInteger total = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
     NSUInteger sfirst = MIN((NSUInteger)v->first_slice, total - 1), scount = v->dim ? MIN((NSUInteger)v->slices, total - sfirst) : total;
     if (type == MTLTextureType2D || type == MTLTextureType1D || type == MTLTextureType2DMultisample || type == MTLTextureType3D) scount = 1;
+    if (type == MTLTextureType3D) sfirst = 0;          // W slices are depth coordinates, not Metal array slices
     if (type == MTLTextureTypeCube) scount = 6;
     if (v->base.kind == K_UAV && v->dim == 0) { sfirst = 0; scount = total; }
     if (fmt == base.pixelFormat && type == base.textureType && first == 0 && count == levels && sfirst == 0 && scount == total)
@@ -1871,6 +1879,99 @@ static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) 
     [enc dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(t[0] ? t[0] : 1, t[1] ? t[1] : 1, t[2] ? t[2] : 1)];
     [enc endEncoding];
 }
+// Pack one texel in the view's format, independently of the backing Metal format (R32 typeless UAVs
+// have integer backing). Uint copies channel bits even for FLOAT/NORM; Float converts only FLOAT/NORM.
+static int uav_clear_pixel(uint32_t format, const uint32_t *values, int floating, uint8_t pixel[16]) {
+    enum { BITS, FLOAT, UNORM, SNORM };
+    static const struct { uint32_t format; uint8_t channels, bits, kind; } formats[] = {
+        {2,4,32,FLOAT}, {3,4,32,BITS}, {4,4,32,BITS},
+        {10,4,16,FLOAT}, {11,4,16,UNORM}, {12,4,16,BITS}, {13,4,16,SNORM}, {14,4,16,BITS},
+        {16,2,32,FLOAT}, {17,2,32,BITS}, {18,2,32,BITS},
+        {24,4,10,UNORM}, {25,4,10,BITS}, {26,3,11,FLOAT},
+        {28,4,8,UNORM}, {30,4,8,BITS}, {31,4,8,SNORM}, {32,4,8,BITS},
+        {34,2,16,FLOAT}, {35,2,16,UNORM}, {36,2,16,BITS}, {37,2,16,SNORM}, {38,2,16,BITS},
+        {41,1,32,FLOAT}, {42,1,32,BITS}, {43,1,32,BITS},
+        {49,2,8,UNORM}, {50,2,8,BITS}, {51,2,8,SNORM}, {52,2,8,BITS},
+        {54,1,16,FLOAT}, {56,1,16,UNORM}, {57,1,16,BITS}, {58,1,16,SNORM}, {59,1,16,BITS},
+        {61,1,8,UNORM}, {62,1,8,BITS}, {63,1,8,SNORM}, {64,1,8,BITS}
+    };
+    for (NSUInteger k = 0; k < sizeof formats / sizeof formats[0]; k++) {
+        if (formats[k].format != format) continue;
+        unsigned channels = formats[k].channels, bits = formats[k].bits, kind = formats[k].kind;
+        if (floating && kind == BITS) return 0; // Float clears of integer views are invalid
+        memset(pixel, 0, 16);
+        unsigned shift = 0;
+        for (unsigned i = 0; i < channels; i++) {
+            unsigned n = bits == 10 && i == 3 ? 2 : bits == 11 && i == 2 ? 10 : bits;
+            uint32_t value = values[i];
+            if (floating) {
+                float f; memcpy(&f, &value, 4);
+                if (kind == FLOAT && bits == 11) {
+                    unsigned mantissa = n - 5;
+                    if (isnan(f)) value = (31u << mantissa) | (1u << (mantissa - 1));
+                    else if (f <= 0) value = 0;
+                    else if (isinf(f)) value = 31u << mantissa;
+                    else {
+                        int exponent; frexp((double)f, &exponent);
+                        int biased = exponent + 14;
+                        if (biased <= 0) value = (uint32_t)nearbyint(ldexp((double)f, 14 + mantissa));
+                        else if (biased >= 31) value = 31u << mantissa;
+                        else value = ((biased - 1) << mantissa) + (uint32_t)nearbyint(ldexp((double)f, mantissa + 1 - exponent));
+                    }
+                }
+                else if (kind == FLOAT && bits == 16) { __fp16 h = f; uint16_t raw; memcpy(&raw, &h, 2); value = raw; }
+                else if (kind == UNORM || kind == SNORM) {
+                    double hi = kind == UNORM ? (1u << n) - 1 : (1u << (n - 1)) - 1;
+                    double lo = kind == UNORM ? 0 : -1;
+                    double x = isnan(f) ? 0 : fmin(1, fmax(lo, f));
+                    value = (uint32_t)(int32_t)nearbyint(x * hi);
+                }
+            }
+            if (bits == 10 || bits == 11) {
+                uint32_t packed; memcpy(&packed, pixel, 4);
+                packed |= (value & ((1u << n) - 1)) << shift;
+                memcpy(pixel, &packed, 4); shift += n;
+            } else memcpy(pixel + i * (bits / 8), &value, bits / 8);
+        }
+        return bits == 10 || bits == 11 ? 4 : channels * bits / 8;
+    }
+    return 0;
+}
+static void clear_texture_uav(d3d_context *c, d3d_view *v, const uint32_t *values, int floating) {
+    d3d_texture *t = (d3d_texture *)v->resource;
+    id<MTLTexture> texture = (__bridge id<MTLTexture>)t->mtl;
+    uint8_t pixel[16];
+    unsigned bpp = uav_clear_pixel(v->format, values, floating, pixel), backing_bpp = 0;
+    d3d_mtl_format(t->desc[TD_FORMAT], &backing_bpp);
+    if (!bpp || bpp != backing_bpp || !texture || texture.sampleCount != 1 || v->mip >= texture.mipmapLevelCount) {
+        vx_log("Direct3D: unsupported texture UAV clear format=%u backing=%u float=%d mip=%u", v->format, t->desc[TD_FORMAT], floating, v->mip);
+        return;
+    }
+    NSUInteger width = MAX((NSUInteger)1, texture.width >> v->mip), height = MAX((NSUInteger)1, texture.height >> v->mip);
+    NSUInteger total = t->dim == 3 ? MAX((NSUInteger)1, texture.depth >> v->mip) : t->desc[TD_ARRAY];
+    NSUInteger first = v->dim ? v->first_slice : 0;
+    NSUInteger count = !v->dim || v->slices == UINT32_MAX ? total - MIN(first, total) : v->slices;
+    if (first >= total || !count || count > total - first) {
+        vx_log("Direct3D: invalid texture UAV clear range first=%lu count=%lu total=%lu", first, count, total);
+        return;
+    }
+    // One plane is reused for every array/depth slice, rather than allocating a full volume. Match the
+    // texture upload path's tightly packed blit rows; the buffer stays immutable and Metal retains it.
+    NSUInteger pitch = width * bpp, image = pitch * height;
+    id<MTLBuffer> staging = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:image options:MTLResourceStorageModeShared];
+    if (!staging) { vx_log("Direct3D: texture UAV clear allocation failed (%lu bytes)", image); return; }
+    uint8_t *dst = staging.contents;
+    for (NSUInteger x = 0; x < width; x++) memcpy(dst + x * bpp, pixel, bpp);
+    for (NSUInteger y = 1; y < height; y++) memcpy(dst + y * pitch, dst, pitch);
+    d3d_end_render(c);
+    // d3d_context_cmd flushes deferred RTV clears before this blit, including clears of the same resource.
+    id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
+    for (NSUInteger i = first; i < first + count; i++)
+        [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:image sourceSize:MTLSizeMake(width, height, 1)
+                  toTexture:texture destinationSlice:t->dim == 3 ? 0 : i destinationLevel:v->mip destinationOrigin:MTLOriginMake(0, 0, t->dim == 3 ? i : 0)];
+    [blit endEncoding];
+    d3d_mark_gpu(c, &t->base);
+}
 // ClearUnorderedAccessView: buffers are filled on the GPU (in order with the other work); a value whose four bytes
 // differ is written as words after the GPU work so far has finished.
 static void clear_uav(d3d_context *c, d3d_view *v, uint32_t value) {
@@ -1900,8 +2001,15 @@ static WINAPI void ctx_copy_structure_count(void *this, d3d_buffer *dst, uint32_
     [blit endEncoding];
     d3d_mark_gpu(c, &dst->base);
 }
-static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *values) { clear_uav(this, v, values[0]); }
-static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) { uint32_t bits; memcpy(&bits, &values[0], 4); clear_uav(this, v, bits); }
+static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *values) {
+    if (v && v->resource->kind == K_TEXTURE) clear_texture_uav(this, v, values, 0);
+    else clear_uav(this, v, values[0]);
+}
+static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) {
+    uint32_t bits[4]; memcpy(bits, values, sizeof bits);
+    if (v && v->resource->kind == K_TEXTURE) clear_texture_uav(this, v, bits, 1);
+    else clear_uav(this, v, bits[0]);
+}
 
 // ---- tables -------------------------------------------------------------------------------------------------------------------------
 // ---- getting the bindings back (each with a reference, as Direct3D gives them) ---------------------------------------------

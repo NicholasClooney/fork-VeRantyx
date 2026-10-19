@@ -308,3 +308,56 @@ failure, preserving its before/after diagnostic behavior checks.
 The integrated remap passed a complete `make -C VXRuntime check`, including the new Metal-validation GPU fixture,
 physical-budget rejection and existing shader/draw/compute tests. The known D3D12 timestamp exception was not
 needed in this pass. The original 173752Z result validates unchanged. The next ED harness run remains pending.
+
+
+### Texture UAV clear follow-up
+
+`20261019T174838Z-elite-keyboard-diagnostic` connects after 15.8 seconds (`o2`, `d3`) and records no unhandled
+exception, first problem or native Metal assertion (`o14=0`, `o18=null`, `o23=null`). The previous t33 translation
+failure is absent from its selected log. This run does not reproduce that fatal shader-creation failure, but its
+final stream remains the SteamVR waiting background (`o12`, `o13`); the automatic controls label is still not input
+or ED scene evidence.
+
+The selected ED PID40907 responds to the three diagnostic samples (`o20`–`o22`), last at approximately 110.006
+seconds. Completed Presents advance 1480/2525/3111 at 90/100/110 seconds, main commits 1808/2854/3441 and completed
+window callbacks 174/194/214. Thread 5, the last Present thread, alternates condition wait / next_drawable / a new
+condition wait; there is no evidence of one permanent wait across those samples. Wait snapshots still overflow.
+
+The last selected-game log line reports unimplemented texture ClearUnorderedAccessView at 17:50:28.524 UTC,
+110.358815 seconds after result.started. Diagnostic elapsed uses a separately captured monotonic origin, so the
+warning cannot be precisely ordered against the last snapshot from these values alone. No later sequence of
+snapshots establishes a stall after this warning. The run's vrserver log has Scene connection records for PID40907
+but no exit/disconnect record; its near-end chaperone activity is not an ED heartbeat. Thus `o1=false`/`d4=true`
+only establish launcher presence, and ED's own lifetime to 180 seconds remains unknown.
+
+The next bounded follow-up moves the three samples to 110/120/130 seconds (`--diagnostic-delay 80`) while keeping
+the 180-second scenario, to observe activity after the current clear boundary. A separate late sample schedule
+would be needed to establish near-end responses. OpenVR Submit, eye-image contents and compositor acceptance of ED
+frames remain unobserved; neither DXGI Presents nor encoder/stream frame rates resolve those questions.
+
+
+Texture UAV Uint/Float clears now pack texels using the UAV view's format and encode ordered Metal buffer-to-texture
+copies into the selected mip and array/depth range. Uint preserves each channel's low bits; Float converts FLOAT,
+UNORM and SNORM views, following Microsoft's
+[Uint](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-clearunorderedaccessviewuint)
+and [Float](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-clearunorderedaccessviewfloat)
+contracts. R32 typeless integer backing is handled through view-format bytes, without requiring RTV usage.
+A single immutable upload plane is reused for all selected slices; deferred RTV clears are emitted first and the
+resource is marked GPU-written. 3D UAV FirstWSlice/WSize and GetDesc retain their requested range. Unsupported
+formats, invalid ranges and allocation failure are logged; existing buffer-clear behavior is unchanged.
+
+The new fixture reports 20 failures on the prior implementation and zero on the final implementation with Metal
+validation enabled. Twelve 2D cases cover integer/float bit patterns, four channels, normalized conversion/clamping,
+half and packed formats, typeless FLOAT/UINT views, three mips and three array slices, untouched subresources,
+copy-before/after and repeated clears. Pending RTV clear followed by UAV clear and copy also passes. Additional
+cases cover 1D array mip0 and partial 3D depth at mip1, WSize=-1 and GetDesc; the atomic texture regression passes.
+The existing 1D texture allocator creates only one mip, so 1D mip1 remains unsupported and its existing out-of-range
+Map path can assert in Metal. This broader allocation/Map issue is not repaired here. Compression, depth, sRGB,
+typeless UAV view formats and other formats outside the clear table remain unsupported. Game validation of the
+clear implementation is pending; removing an unimplemented call alone will not prove ED eye-image submission.
+
+
+Integration ran `make -C VXRuntime check` twice; each stopped only at the user-waived D3D12 second-timestamp-zero
+failure. The new clear fixture, atomic/high-SRV fixtures, 21 shader compilations and draw/compute regressions passed.
+Every original Makefile check after D3D12 was then run unchanged and passed. This is not a fully green check run,
+and the D3D12 flake remains unresolved. The original 174838Z result validates without modifying sealed artifacts.
