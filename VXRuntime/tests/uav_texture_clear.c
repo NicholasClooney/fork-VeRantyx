@@ -112,6 +112,46 @@ static void test_3d(UINT count) {
     }
     ID3D11UnorderedAccessView_Release(uav); ID3D11Texture3D_Release(texture); ID3D11Texture3D_Release(staging);
 }
+// Queue every clear and snapshot before mapping: eviction must not recycle an in-flight pattern.
+// The larger case exceeds the tile size, exercises its short tail and exhausts the byte budget.
+static void test_cache(UINT width, UINT height, UINT rounds) {
+    D3D11_TEXTURE2D_DESC td = { width, height, 1, 1, DXGI_FORMAT_R32G32B32A32_UINT, {1, 0},
+        D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0 };
+    ID3D11Texture2D *texture = NULL, *snapshots[20] = {0};
+    ID3D11UnorderedAccessView *uav = NULL;
+    UINT expected[20][4];
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &texture)));
+    if (!texture) return;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)texture, NULL, &uav)));
+    if (!uav) { ID3D11Texture2D_Release(texture); return; }
+    td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    for (UINT i = 0; i < rounds; i++) {
+        UINT pattern = i == 2 || i == 3 || i == rounds - 1 ? 0 : i;
+        expected[i][0] = 0x7fc12345u + pattern;
+        expected[i][1] = 0xffffffffu - pattern;
+        expected[i][2] = 0x80001234u + pattern;
+        expected[i][3] = 0x3f800001u + pattern;
+        CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &snapshots[i])));
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(ctx, uav, expected[i]);
+        if (snapshots[i]) ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)snapshots[i], (ID3D11Resource *)texture);
+    }
+    for (UINT i = 0; i < rounds; i++) {
+        if (!snapshots[i]) continue;
+        D3D11_MAPPED_SUBRESOURCE m;
+        HRESULT hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)snapshots[i], 0, D3D11_MAP_READ, 0, &m);
+        CHECK(SUCCEEDED(hr));
+        if (SUCCEEDED(hr)) {
+            int ok = 1;
+            for (UINT y = 0; y < height; y++) for (UINT x = 0; x < width; x++)
+                if (memcmp((BYTE *)m.pData + y * m.RowPitch + x * 16, expected[i], 16)) ok = 0;
+            CHECK(ok);
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)snapshots[i], 0);
+        }
+        ID3D11Texture2D_Release(snapshots[i]);
+    }
+    ID3D11UnorderedAccessView_Release(uav); ID3D11Texture2D_Release(texture);
+    printf("cache %ux%u rounds=%u failures=%d\n", width, height, rounds, failures);
+}
 int main(void) {
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx))) return 1;
     const UINT u[4] = { 0x3f800001, 0x80001234, 0x7fc12345, 0xffffffff };
@@ -135,6 +175,15 @@ int main(void) {
     test_2d(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, 4, 1, f, &packed_norm, 0);
     test_2d(DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT, 4, 1, f, &packed_float, 0);
     test_1d(); test_3d(2); test_3d(~0u);
+    test_cache(17, 5, 20); test_cache(1024, 513, 10);
     ID3D11DeviceContext_ClearState(ctx); ID3D11DeviceContext_Release(ctx); ID3D11Device_Release(dev);
+    // A fresh context/device must build its own planes after the previous cache has been destroyed.
+    dev = NULL; ctx = NULL;
+    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+    CHECK(SUCCEEDED(hr));
+    if (SUCCEEDED(hr)) {
+        test_cache(17, 5, 4);
+        ID3D11DeviceContext_Release(ctx); ID3D11Device_Release(dev);
+    }
     printf("uav_texture_clear: %d failures\n", failures); return failures ? 1 : 0;
 }

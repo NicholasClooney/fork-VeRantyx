@@ -361,3 +361,47 @@ Integration ran `make -C VXRuntime check` twice; each stopped only at the user-w
 failure. The new clear fixture, atomic/high-SRV fixtures, 21 shader compilations and draw/compute regressions passed.
 Every original Makefile check after D3D12 was then run unchanged and passed. This is not a fully green check run,
 and the D3D12 flake remains unresolved. The original 174838Z result validates without modifying sealed artifacts.
+
+
+### Clear upload cost investigation
+
+`20261019T180141Z-elite-keyboard-diagnostic` connects after 18.2 seconds (`o2`, `d3`) and does not record the texture
+clear warning, unhandled exception, first problem or native Metal assertion (`o14=0`, `o18=null`, `o23=null`). The
+final capture remains the SteamVR waiting environment. Stream/capture rates fall to 8.9/9.9 fps (`o4`, `o6`), with
+350.7ms p95 stream interval (`o7`) and GPU utilization 12 (`o10`). These are not ED eye-frame rates.
+
+At 110/120/130 seconds, completed Presents are 125/221/467 and main commits 125/230/784 (`o21`); process CPU time
+is 91.402074/100.556393/113.076883 seconds. Work continues. The last Present thread 5 (`o22`) last completed
+LeaveCriticalSection at the first snapshot and is in newly entered condition waits at the later two, not a sampled
+texture clear or proven continuous GPU wait. Overflow remains true. The earlier run's 90/100/110-second samples
+and different startup progression do not establish matched-stage performance causality.
+
+The texture clear implementation contains no explicit CPU/GPU wait, but constructs and fills a new upload plane
+per call. Metal allocation or downstream GPU work may still cost time. No existing diagnostic counts clear calls,
+clear wall time or GPU submitted/completed backlog, so allocation overhead, changed work after a correct clear,
+and host load remain competing explanations. The separate buffer-clear path can explicitly wait for nonuniform
+bytes; that behavior is not evidence of a wait in texture clear.
+
+A semantics-preserving optimization caches immutable upload tiles per context, bounded to eight entries and
+32MiB, with tiles at most 8MiB. Repeated hits avoid allocation and CPU plane construction; first use and cache
+misses still allocate. Retaining command buffers preserve evicted data for in-flight GPU work. Large planes use
+row tiles without overwriting published data. Existing `VXRT_STATS=1` enables fixed-count summaries at clear
+calls 1/16/256/4096/65536 plus normal teardown; default operation emits no new cache logs.
+
+Performance validation must compare the correct pre-cache implementation (5de5ab7) with the optimized implementation,
+using identical settings and sampling windows, preferably ABBA. The older unsupported/no-op clear is not an equivalent
+performance baseline. Game performance and scene submission remain pending measurement; cache correctness does not
+prove that clear overhead caused this run's slowdown.
+
+
+With Metal validation enabled, the cache fixture preserves all prior clear checks and passes queued A/B/A pattern
+changes, entry eviction, 8MiB tiles with a final partial row and byte-budget eviction before readback. Destroying and
+recreating the device/context starts a fresh cache. The measured first context reports 57 calls, 15 hits, 42 builds,
+67,134,208 total built bytes and 38 evictions, with resident cache bytes at 33,554,432. The second begins with one
+build/no hits and finishes with four calls/two hits/two builds. Default logging emits no new cache summaries.
+The 32MiB bound covers retained cache entries, not evicted buffers still retained by in-flight Metal commands.
+GPU correctness and cache reuse are verified; no game-performance improvement is established by these fixture counts.
+
+The integrated cache change passed a complete `make -C VXRuntime check` without needing the D3D12 timestamp
+exception. The original 180141Z result validates unchanged. A matched harness A/B with `VXRT_STATS=1` remains
+required before claiming a performance benefit.

@@ -405,7 +405,19 @@ static WINAPI HRESULT device_create_sampler(void *this, const uint32_t *desc, vo
 // ---- the context's bindings -------------------------------------------------------------------------------------------------
 enum { STAGE_VS, STAGE_PS, STAGE_CS, STAGE_GS, STAGES };
 #define VB_BASE 14                    // vertex buffer slot s is Metal buffer 14 + s (constant buffers take 0..13)
+enum { UAV_CLEAR_SLOTS = 8, UAV_CLEAR_TILE_BYTES = 8 * 1024 * 1024, UAV_CLEAR_CACHE_BYTES = 32 * 1024 * 1024 };
+typedef struct {
+    void *buffer;
+    NSUInteger width, rows, bpp, bytes;
+    uint8_t pixel[16];
+    uint64_t used;
+} uav_clear_plane;
 typedef struct d3d_draw_state {
+    uav_clear_plane clear_planes[UAV_CLEAR_SLOTS];
+    NSUInteger clear_bytes;
+    int clear_stats;
+    uint64_t clear_clock, clear_hits, clear_builds, clear_built_bytes, clear_evictions;
+
     d3d_layout *layout;
     d3d_buffer *vb[16]; uint32_t stride[16], offset[16];
     d3d_buffer *ib; uint32_t ib_format, ib_offset, topology;
@@ -437,8 +449,18 @@ typedef struct d3d_draw_state {
 } d3d_draw_state;
 
 static d3d_draw_state *state_of(d3d_context *c) {
-    if (!c->draw) c->draw = calloc(1, sizeof *c->draw);
+    if (!c->draw) {
+        c->draw = calloc(1, sizeof *c->draw);
+        c->draw->clear_stats = getenv("VXRT_STATS") != NULL;
+    }
     return c->draw;
+}
+static void uav_clear_stats(d3d_draw_state *s) {
+    if (s->clear_stats)
+        vx_log("Direct3D: UAV clear cache calls=%llu hits=%llu builds=%llu bytes=%llu evictions=%llu resident=%lu",
+               (unsigned long long)(s->clear_hits + s->clear_builds), (unsigned long long)s->clear_hits,
+               (unsigned long long)s->clear_builds, (unsigned long long)s->clear_built_bytes,
+               (unsigned long long)s->clear_evictions, s->clear_bytes);
 }
 // Bindings keep a reference, as Direct3D does.
 static void bind(void *slot_ptr, void *obj) {
@@ -461,6 +483,8 @@ void d3d_draw_release(d3d_context *c) {
     }
     for (int i = 0; i < 4; i++) bind(&s->so[i], NULL);
     for (int i = 0; i < 3; i++) if (s->gs_scratch[i]) CFRelease(s->gs_scratch[i]);
+    for (int i = 0; i < UAV_CLEAR_SLOTS; i++) if (s->clear_planes[i].buffer) CFRelease(s->clear_planes[i].buffer);
+    uav_clear_stats(s);
     free(s);
     c->draw = NULL;
 }
@@ -1937,6 +1961,44 @@ static int uav_clear_pixel(uint32_t format, const uint32_t *values, int floating
     }
     return 0;
 }
+// Context ownership isolates devices and releases cached planes with the context. Planes never change
+// after publication: normal retaining command buffers keep evicted buffers alive until GPU completion.
+static id<MTLBuffer> uav_clear_plane_buffer(d3d_context *c, NSUInteger width, NSUInteger rows,
+                                          unsigned bpp, const uint8_t pixel[16]) {
+    d3d_draw_state *s = state_of(c);
+    for (unsigned i = 0; i < UAV_CLEAR_SLOTS; i++) {
+        uav_clear_plane *p = &s->clear_planes[i];
+        if (p->buffer && p->width == width && p->rows == rows && p->bpp == bpp && !memcmp(p->pixel, pixel, bpp)) {
+            p->used = ++s->clear_clock; s->clear_hits++;
+            return (__bridge id<MTLBuffer>)p->buffer;
+        }
+    }
+    NSUInteger pitch = width * bpp, bytes = pitch * rows;
+    unsigned slot;
+    for (;;) {
+        slot = UAV_CLEAR_SLOTS;
+        unsigned oldest = UAV_CLEAR_SLOTS;
+        for (unsigned i = 0; i < UAV_CLEAR_SLOTS; i++) {
+            if (!s->clear_planes[i].buffer) { slot = i; continue; }
+            if (oldest == UAV_CLEAR_SLOTS || s->clear_planes[i].used < s->clear_planes[oldest].used) oldest = i;
+        }
+        if (slot < UAV_CLEAR_SLOTS && s->clear_bytes + bytes <= UAV_CLEAR_CACHE_BYTES) break;
+        uav_clear_plane *p = &s->clear_planes[oldest];
+        s->clear_bytes -= p->bytes;
+        CFRelease(p->buffer); memset(p, 0, sizeof *p); s->clear_evictions++;
+    }
+    id<MTLBuffer> buffer = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    if (!buffer) return nil;
+    uint8_t *dst = buffer.contents;
+    for (NSUInteger x = 0; x < width; x++) memcpy(dst + x * bpp, pixel, bpp);
+    for (NSUInteger y = 1; y < rows; y++) memcpy(dst + y * pitch, dst, pitch);
+    uav_clear_plane *p = &s->clear_planes[slot];
+    p->buffer = (void *)CFBridgingRetain(buffer);
+    p->width = width; p->rows = rows; p->bpp = bpp; p->bytes = bytes;
+    memcpy(p->pixel, pixel, bpp); p->used = ++s->clear_clock;
+    s->clear_bytes += bytes; s->clear_builds++; s->clear_built_bytes += bytes;
+    return buffer;
+}
 static void clear_texture_uav(d3d_context *c, d3d_view *v, const uint32_t *values, int floating) {
     d3d_texture *t = (d3d_texture *)v->resource;
     id<MTLTexture> texture = (__bridge id<MTLTexture>)t->mtl;
@@ -1955,20 +2017,23 @@ static void clear_texture_uav(d3d_context *c, d3d_view *v, const uint32_t *value
         vx_log("Direct3D: invalid texture UAV clear range first=%lu count=%lu total=%lu", first, count, total);
         return;
     }
-    // One plane is reused for every array/depth slice, rather than allocating a full volume. Match the
-    // texture upload path's tightly packed blit rows; the buffer stays immutable and Metal retains it.
-    NSUInteger pitch = width * bpp, image = pitch * height;
-    id<MTLBuffer> staging = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:image options:MTLResourceStorageModeShared];
+    // Bound even unusually large planes; a cached tile also serves the final, shorter row group.
+    NSUInteger pitch = width * bpp;
+    if (pitch > UAV_CLEAR_TILE_BYTES) return;
+    NSUInteger rows = MIN(height, UAV_CLEAR_TILE_BYTES / pitch), image = pitch * rows;
+    id<MTLBuffer> staging = uav_clear_plane_buffer(c, width, rows, bpp, pixel);
     if (!staging) { vx_log("Direct3D: texture UAV clear allocation failed (%lu bytes)", image); return; }
-    uint8_t *dst = staging.contents;
-    for (NSUInteger x = 0; x < width; x++) memcpy(dst + x * bpp, pixel, bpp);
-    for (NSUInteger y = 1; y < height; y++) memcpy(dst + y * pitch, dst, pitch);
+    d3d_draw_state *s = c->draw;
+    uint64_t calls = s->clear_hits + s->clear_builds;
+    if (s->clear_stats && (calls == 1 || calls == 16 || calls == 256 || calls == 4096 || calls == 65536))
+        uav_clear_stats(s);
     d3d_end_render(c);
     // d3d_context_cmd flushes deferred RTV clears before this blit, including clears of the same resource.
     id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
     for (NSUInteger i = first; i < first + count; i++)
-        [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:image sourceSize:MTLSizeMake(width, height, 1)
-                  toTexture:texture destinationSlice:t->dim == 3 ? 0 : i destinationLevel:v->mip destinationOrigin:MTLOriginMake(0, 0, t->dim == 3 ? i : 0)];
+      for (NSUInteger y = 0; y < height; y += rows)
+        [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:image sourceSize:MTLSizeMake(width, MIN(rows, height - y), 1)
+                  toTexture:texture destinationSlice:t->dim == 3 ? 0 : i destinationLevel:v->mip destinationOrigin:MTLOriginMake(0, y, t->dim == 3 ? i : 0)];
     [blit endEncoding];
     d3d_mark_gpu(c, &t->base);
 }
