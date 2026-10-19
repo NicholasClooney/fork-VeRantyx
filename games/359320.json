@@ -18,8 +18,8 @@
   "status": {
     "state": "partial",
     "summary": {
-      "en": "Connects to SteamVR and survives the 60-second diagnostic; the final frame is still the SteamVR waiting background. ED rendering, authentication and keyboard/mouse input are unverified.",
-      "ja": "SteamVR接続と60秒の診断継続を確認。最終画像は待機背景で、ゲーム描画・認証・入力は未確認。"
+      "en": "Connects to SteamVR, but the final stream remains the waiting background. Latest run has 11 Metal shader compilation failures and a Present plateau; ED scene rendering, authentication and physical input remain unverified.",
+      "ja": "SteamVR接続を確認。最終画像は待機背景で、EDの描画・認証・入力は未確認。最新実行ではシェーダーのコンパイル失敗とPresent停止を観測。"
     },
     "checked": "2026-10-19",
     "machine": "Apple M4 Max"
@@ -43,6 +43,14 @@
     {
       "summary": "20261018T174219Z-elite-keyboard-diagnostic o2=21.3/d3=true confirms the ED Scene connection; o14=0, o16={}, o18=null and d4=true. Its automatic controls level/d5 reflects legacy binding files, not working keyboard/mouse. o11-o13 final image is the SteamVR waiting background; o4/o6 compositor/stream frame rates are not ED rendering rates. No application Submit/Present evidence or authentication result is established.",
       "since": "2026-10-18"
+    },
+    {
+      "summary": "2026-10-19 end-of-day priorities: (1) investigate min16float/min16uint vector-to-scalar half/ushort casts causing11 Metal shader compile failures in181052Z; (2) investigate later Present1401/main-commit2231 plateau without assuming causality; (3) OpenVR Submit remains unobserved and ED has not demonstrated its own scene; (4) matched5de5ab7 versus222e4d0 ABBA is not done. Work paused, no further runs today.",
+      "since": "2026-10-19"
+    },
+    {
+      "summary": "Unverified or unresolved: 1D textures have only1 mip and out-of-range Map can assert; ClearState only clearsRT; signed atomic execution not tested; other-game vr-check and ARM64 full-suite not completed; harness d4/o1 track launcher rather than ED lifetime; D3D12 zero-second-timestamp flake remains user-waived, not fixed. Real headset/input/authentication/playability remain unverified.",
+      "since": "2026-10-19"
     }
   ],
   "notes": [
@@ -70,6 +78,7 @@
     "20261019T172253Z-elite-keyboard-diagnostic o2=17.5/d3=true, o23=null: previous Metal descriptor assertion not reproduced. o21 completed Presents advance1200/2193/2639 at90/100/110s; o22 last-Present thread5 alternates wake/Present/10ms condition wait, not a permanent Present block. Final stream remains SteamVR background; real Submit remains unobserved. o14=1/o18 records a fatal shader-creation stack at119.667s, before the120s harness deadline; o1=false/d4=true reflect the still-alive launcher and do not prove an exception-free game run. Log307 reports unsupported raw/structured buffer t33. Exact failing stage and correlation with that log entry remain unknown; inspect bounded resource declarations before changing binding layout. Shader-translation failure logs now add stage, bounded SHA-256 and complete-or-explicitly-incomplete resource-class slot masks without bytecode payload or semantic changes. A new run must determine the actual failing resource budget; no t33 fix is claimed.",
     "20261019T173752Z-elite-keyboard-diagnostic o2=18.8/d3=true but o1=true/d4=false, o14=1/o18 fatal shader-creation stack about109s into a180s scenario. Log307-308 identify unsupported t33 in a vertex shader with complete declarations b0/b1 and structured t33/t38; the fatal exception follows8ms later. Final image remains SteamVR background and o23=null. Implemented per-shader raw/structured SRV physical remapping with128 logical slots, stage-reserved physical slots and separate SRV/CB size regions; explicit budget failure remains. High typed texture binding and existing ClearState reset gaps are unchanged. Game validation of the remap remains pending.",
     "20261019T174838Z-elite-keyboard-diagnostic o2=15.8/d3=true, o14=0/o18=null/o23=null; no t33 shader failure in selected log. o21 completed Presents1480/2525/3111 at90/100/110s advance, and o20-o22 show PID40907 responses to about110s. The final stream remains SteamVR background. Last log line at17:50:28.524 reports unimplemented texture UAV clear; no later diagnostic sequence proves stall. No selected-PID exit record or near-end heartbeat establishes ED lifetime to180s: o1=false/d4=true track launcher presence only. Next sample schedule110/120/130s targets activity after the clear boundary; actual Submit/ED eye frames remain unknown. Texture UAV Uint/Float clear now packs view-format bytes and copies the selected mip/array/depth range in GPU order, with R32 typeless backing compatibility and preserved3D view ranges. New Metal-validation fixture changes20 prior failures to0; atomic texture checks pass. Existing1D multi-mip allocation/Map limitation and unsupported view formats remain. Game validation is pending.",
-    "20261019T180141Z-elite-keyboard-diagnostic o2=18.2/d3=true, o14=0/o18=null/o23=null, no texture-clear warning. Stream/capture fps8.9/9.9 and GPU12 differ from prior run but final frame remainsSteamVR background. o21 Presents125/221/467 and main commits125/230/784 at110/120/130s still advance; o22 thread5 samples completedCS then newCV waits, notclear. Existing diagnostics do not measure clear cost orGPU backlog, so causality is unknown. Bounded context-owned immutable upload caching targets repeated allocation/fill; correct5de5ab7 staging clear is the A/B baseline, not priorunsupported no-op. Performance/ED Submit remain unverified."
+    "20261019T180141Z-elite-keyboard-diagnostic o2=18.2/d3=true, o14=0/o18=null/o23=null, no texture-clear warning. Stream/capture fps8.9/9.9 and GPU12 differ from prior run but final frame remainsSteamVR background. o21 Presents125/221/467 and main commits125/230/784 at110/120/130s still advance; o22 thread5 samples completedCS then newCV waits, notclear. Existing diagnostics do not measure clear cost orGPU backlog, so causality is unknown. Bounded context-owned immutable upload caching targets repeated allocation/fill; correct5de5ab7 staging clear is the A/B baseline, not priorunsupported no-op. Performance/ED Submit remain unverified.",
+    "20261019T181052Z-elite-keyboard-diagnostic on222e4d0: o2=18.3/d3=true; o14=0/o18=null/o23=null and o1=false/d4=true do not establish shader success or ED lifetime. Log378-448 has11 translated-shader Metal compile failures: float2/float3 to scalarhalf and uint2 to scalarushort. o21 Presents1401 and main commits2231 plateau at110/120/130s while CPU132.271849/142.471998/152.555886s and callbacks401/421/441 grow. o4/o6=58.1/58.0fps and o7=20.0ms recover in this singleB run, but noABBA was done. Log348 only shows cachecalls1/hits0/builds1/bytes1, not a measured cache-hit benefit. o12=11.5/o13=.241 still describeSteamVR background. RealOpenVR Submit and ED scene draws remain unobserved."
   ]
 }

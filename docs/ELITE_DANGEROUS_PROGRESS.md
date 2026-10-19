@@ -1,11 +1,12 @@
 # Elite Dangerous support progress
 
-Last updated: 2026-10-18 (UTC).
+Last updated: 2026-10-19 (UTC).
 
 Goal: run the legally installed Windows game on VXRuntime with Apple Vision Pro and keyboard/mouse input.
-Current status: **ED connects to SteamVR, but the desktop window is black and the captured VR image is still the
-SteamVR waiting environment. It is not verified playable.** Authentication, game scene rendering, physical input
-and real AVP playback remain unverified. The official launcher has not been implemented or bypassed.
+Current status: **ED connects to SteamVR, but the captured VR image is still the SteamVR waiting environment.
+Its own scene rendering and playable status are not verified.** The desktop window was previously reported black;
+its latest contents, authentication, physical input and real AVP playback remain unverified. The official launcher
+has not been implemented or bypassed.
 
 The first implementation snapshot is [a69ce22](https://github.com/NicholasClooney/fork-VeRantyx/commit/a69ce221932a36e59e10f610fd1daca5e4cdd5bb)
 on `codex/elite-dangerous-vr-support`. This page is a coarse progress log, updated as verified work lands.
@@ -72,16 +73,21 @@ The final focused tests, including module mapping and clock-failure cleanup, pas
 full `make check`; the final allowlist version encountered the known D3D12 second-timestamp failure. This remains
 an explicit test exception, not a passing final full suite or a black-screen fix.
 
-## Next work
+## Next work (paused at the user's end-of-day request)
 
-Locate a specific failure from the bounded CPU evidence before changing rendering behavior. The next investigation
-needs caller/wait-object evidence rather than interpreting kernel-library samples as CPU percentages or a deadlock.
-A transparent real OpenVR Submit observation point has not yet been established, so that remains
-unknown rather than introducing a behavior-changing proxy. Only implement a further compatibility fix once the
-evidence identifies a specific failure.
+1. Investigate the 11 translated shaders that fail Metal compilation in `20261019T181052Z-elite-keyboard-diagnostic`:
+   vector float2/float3 expressions are cast to scalar half, and uint2 to scalar ushort. The next lead is
+   min-precision min16float/min16uint handling in DXBC-to-MSL (`dxbc.c`); no repair has been started or verified.
+2. Recheck the later Present/main-commit plateau at 1401/2231 after those compilation errors. CPU and window
+   callbacks continue; neither a deadlock nor the causal link to those shader failures is established.
+3. Establish transparent real OpenVR Submit evidence if needed. Submit remains unobserved, the final stream is
+   still the SteamVR waiting background, and ED has not been demonstrated to draw its own scene. Do not introduce
+   a behavior-changing Valve proxy or infer eye submissions from desktop Presents or stream FPS.
+4. The matched 5de5ab7 versus 222e4d0 ABBA performance comparison was not done. The single B run's near-60 stream
+   rate is not an A/B conclusion. Keep stage progress, settings, load and cache/overlay state visible in a later comparison.
 
-Work stopped for the agreed break before the 22:03 UTC deadline on 2026-10-18. Test processes and listeners were
-cleaned up; no further run is scheduled. Resume from the evidence above, not from an assumed rendering or login fix.
+No new fixes, subagents, game runs or ABBA are scheduled today. The sections below retain chronological evidence;
+older statements that a follow-up was pending refer to that point in the investigation.
 
 ## Wait/caller diagnostic implementation (2026-10-19)
 
@@ -405,3 +411,48 @@ GPU correctness and cache reuse are verified; no game-performance improvement is
 The integrated cache change passed a complete `make -C VXRuntime check` without needing the D3D12 timestamp
 exception. The original 180141Z result validates unchanged. A matched harness A/B with `VXRT_STATS=1` remains
 required before claiming a performance benefit.
+
+
+## End-of-day handoff — 2026-10-19
+
+All run IDs below have suffix `-elite-keyboard-diagnostic`. These are diagnostic results, not playable milestones.
+
+| Run UTC | Measured result and subsequent work |
+|---|---|
+| 20261019T165747Z | o21 Presents 1/2/108 at 30/40/50s; o22 caller/wait snapshots did not establish a deadlock. Added delayed sampling (d6cd6e1). |
+| 20261019T170427Z | Early PEB/ProcessParameters access violation before any snapshots (o1/o14/o18). Repaired diagnostic startup TEB attachment, server cleanup and shifted-schedule validation (1d5b325); native localtime corruption mechanism was reproduced, game causality not proven. |
+| 20261019T171403Z | Selected log contains R32Float atomic-usage Metal assertion; no Windows exception. Corrected R32 typeless UAV backing/views/shared reopening and added assertion classification (58f35e3). |
+| 20261019T172253Z | Presents 1200/2193/2639 at 90/100/110s (o21); shader-creation fatal stack before the 120s deadline (o14/o18), with unsupported buffer t33 in the log. Added bounded failure resource summaries (a8c9747). |
+| 20261019T173752Z | Vertex shader declares b0/b1 and structured t33/t38; fatal exception follows its failure by 8ms (log307–308, o14/o18), well before the 180s deadline. Implemented stage-safe sparse SRV mapping and auxiliary table separation (13b4fcb). |
+| 20261019T174838Z | No t33 failure or unhandled exception; Presents 1480/2525/3111 (o21). Last log warns texture UAV clear is missing. Implemented view-format/range-aware ordered clears (5de5ab7); no post-warning stall was established. |
+| 20261019T180141Z | Clear warning absent; capture/stream 8.9/9.9fps and interval p95 350.7ms (o4/o6/o7), Presents 125/221/467 (o21), still background. Added bounded immutable upload cache (222e4d0); slowdown causality remains unknown. |
+| 20261019T181052Z | Single cache-enabled B run: capture/stream 58.1/58.0fps, p95 20.0ms (o4/o6/o7); still background, 11 Metal shader compilation failures, and Presents plateau at 1401 (o21). No ABBA or min-precision fix followed. |
+
+The final run connects after 18.3 seconds (`o2`, `d3=true`) and reports `o14=0`, `o18=null`, `o23=null` and
+`o1=false`/`d4=true`. These null error classifications do not mean its shaders compiled. Selected log lines
+378–448 contain 11 `translated shader ... did not compile` records, with scalar half/ushort casts of vector
+expressions. The earliest is at 18:12:09.822 UTC. At 110.006/120.007/130.003s, `o21` has entered/completed/success
+Presents 1401 throughout and main commits 2231 throughout; CPU increases 132.271849 → 142.471998 → 152.555886s
+and completed window callbacks 401 → 421 → 441. This is a presentation plateau with other process activity,
+not proof that the entire game has stopped or that the shader errors caused the plateau.
+
+Log line 348 records only the first cache summary: one call, no hits, one one-byte build, no evictions and one byte
+resident. It does not establish a high cache-hit rate or explain the recovered stream rate. The coordinator reported
+load around 6–8; there was no matched A/B. The final capture remains the SteamVR waiting environment (`o12=11.5`,
+`o13=0.241`), and automatic controls/draws are not ED rendering evidence. No real OpenVR Submit is observed.
+
+Outstanding verification and limits:
+
+- Existing 1D texture creation forces one mip; its out-of-range Map can assert. Multi-mip 1D behavior is not fixed.
+- ClearState still only clears render targets; full stage-state reset is not implemented or verified.
+- R32Sint descriptor/view creation was tested, but signed atomic execution was not.
+- Other-game `vr-check`, ARM64 full-suite and real AVP/input playtests were not completed for today's changes.
+- Harness `o1`/`d4` track the launcher, which can outlive ED while cleaning up SteamVR. They do not prove ED's
+  own lifetime or an exception-free scenario; diagnostic responses establish only their sampled times.
+- The D3D12 zero second-timestamp flake remains user-waived and unresolved. The texture-clear check hit it twice
+  with the remaining original checks run separately; the final cache commit passed a full check without it.
+- Authentication, official launcher handoff, physical keyboard/mouse/controllers, scene correctness and playable
+  status remain unverified. Stop on explicit anti-cheat evidence; no authentication/ownership bypass was attempted.
+
+The final cache implementation and its synthetic GPU fixtures are verified as described above. Today's game
+results do not justify an ED draws/runs/playable claim. Work is paused; helpers are closed.
