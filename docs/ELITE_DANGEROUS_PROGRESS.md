@@ -263,3 +263,48 @@ has been implemented yet.
 The integrated failure diagnostic passed `make -C VXRuntime check`, including its new fixture. The next authorized
 harness run should retain 90/100/110-second sampling and extend the scenario to 180 seconds so a near-120-second
 game exit is observed away from the harness deadline. Real-game failure metadata remains pending.
+
+
+### Sparse high-slot structured buffers
+
+`20261019T173752Z-elite-keyboard-diagnostic` connects after 18.8 seconds (`o2`, `d3`) but exits early (`o1=true`,
+`d4=false`) with the same fatal exception (`o14=1`, `o18`) at 17:39:41.208, about 109 seconds after start and well
+before the 180-second deadline. This independently rules out that deadline as the normal cause of the earlier
+late exception. The final stream remains the waiting background; `o23=null` does not reproduce the Metal assertion.
+
+Selected log lines 307–308 record a failed vertex shader, SHA-256
+`55976b9167c0527be6393365f0067cc34bf668697b5984b68004e154318d071d`, with a complete declaration scan: CB b0/b1 and
+structured SRVs t33/t38, no raw/typed/UAV declarations. The unsupported-t33 diagnostic precedes the fatal exception
+by 8ms, consistent with the previously identified shader-creation fatal branch. This is a small resource inventory
+with high logical indices, not evidence of exceeding Metal's physical buffer budget.
+
+Raw/structured SRVs now have a per-shader logical-to-physical map over t0..t127. The map reserves declared constant
+buffers, the fixed UAV range and the auxiliary buffer. Vertex shaders also reserve all vertex-input slots and their
+kernel-variant internal slots; geometry shaders reserve their internal slots. SRVs use available high slots and then
+unused constant-buffer slots. A shader exceeding the remaining physical budget still fails explicitly. Both vertex
+variants share their map. This does not add argument buffers or extend high-slot typed texture binding.
+
+Runtime SRV ownership, set/get, unbinding, resource-hazard and geometry dependency scans cover all 128 logical slots.
+Bindings use the shader's map. SRV byte sizes and CB sizes occupy separate auxiliary-table regions, and UAV-counter
+addresses follow the new layout. Buffer views include the underlying allocation offset and clamp their size to the
+view and resource bounds. Existing ClearState only clears render targets; its broader state-reset gap is unchanged.
+Game validation of this binding change is still pending; no ED scene rendering or Submit success is claimed.
+
+
+Focused regression on the pre-remap runtime fails CreateComputeShader with E_INVALIDARG and the t33 diagnostic.
+On the remapped runtime with `MTL_DEBUG_LAYER=1`, the new fixture reports zero failures: CS t33/t64/t127 checks
+view offsets, sizes, bounds and a dynamic b9 constant-buffer access (13 expected values); VS b0/b1 plus t33/t38
+runs with real vertex input at VB8; PS raw t127 and GS structured t127 produce expected pixels 0xff405040 and
+0xff405060. All four stages pass high-slot retain/get/replace/explicit-unbind reference-count checks. Dedicated
+ClearState and context-destruction reference-count assertions are not included.
+
+The host fixture checks all 128 logical entries, unique physical bindings and stage reservations, and rejects a
+15-SRV vertex shader with a physical-budget error. This deliberately negative fixture is excluded only from the
+success-only dxbcscan list and tested for rejection in high-srv-check. Repository-owned HLSL/DXBC/headers are
+included and reproducible with the existing d3dcompiler_43.dll; no game shader was copied into the repository.
+The existing failure-diagnostic fixture now accepts sparse high slots and separately checks an exhausted-budget
+failure, preserving its before/after diagnostic behavior checks.
+
+The integrated remap passed a complete `make -C VXRuntime check`, including the new Metal-validation GPU fixture,
+physical-budget rejection and existing shader/draw/compute tests. The known D3D12 timestamp exception was not
+needed in this pass. The original 173752Z result validates unchanged. The next ED harness run remains pending.

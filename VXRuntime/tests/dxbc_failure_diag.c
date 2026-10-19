@@ -46,7 +46,7 @@ static void unchanged(size_t n, int expected) {
     dxbc_free(&before); dxbc_free(&after);
 }
 int main(void) {
-    begin(); decl(162, 7, 33, 16); // The translator stops here; the diagnostic must keep scanning.
+    begin(); decl(162, 7, 33, 16); // Sparse high slots are valid; diagnosis still scans all later declarations.
     decl(89, 8, 13, 4); decl(161, 7, 127, 0); decl(88, 7, 64, 0x5555);
     decl(157, 30, 0, 0); decl(158, 30, 6, 4); decl(156, 30, 7, 0x4444);
     size_t n = finish(); dxbc_resource_diag d = scan(n);
@@ -54,7 +54,7 @@ int main(void) {
     assert(has(d, DXBC_DIAG_STRUCTURED, 33) && has(d, DXBC_DIAG_CB, 13));
     assert(has(d, DXBC_DIAG_RAW, 127) && has(d, DXBC_DIAG_TYPED, 64));
     assert(has(d, DXBC_DIAG_UAV_RAW, 0) && has(d, DXBC_DIAG_UAV_STRUCTURED, 6) && has(d, DXBC_DIAG_UAV_TYPED, 7));
-    unchanged(n, -1);
+    unchanged(n, 0);
     for (size_t i = 0; i < n; i++) assert(scan(i).status == DXBC_DIAG_MALFORMED);
     unsigned char unaligned[sizeof blob + 1]; memcpy(unaligned + 1, blob, n);
     dxbc_resource_summary(unaligned + 1, n, &d); assert(d.status == DXBC_DIAG_COMPLETE);
@@ -97,6 +97,9 @@ int main(void) {
         blob[seed % count] ^= seed;
         d = scan(n); assert(d.status >= DXBC_DIAG_COMPLETE && d.status <= DXBC_DIAG_LIMIT);
     }
+    begin();
+    for (unsigned i = 0; i < 23; i++) decl(161, 7, i, 0);
+    n = finish(); unchanged(n, -1); // Complete declaration summary even when physical bindings are exhausted.
     puts("dxbc_failure_diag: ok");
     return 0;
 }

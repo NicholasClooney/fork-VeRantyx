@@ -6,6 +6,8 @@
 
 enum { DXBC_PIXEL = 0, DXBC_VERTEX = 1, DXBC_GEOMETRY = 2, DXBC_COMPUTE = 5 };
 
+#define DXBC_SRV_SLOTS 128
+
 // One element of an input or output signature.
 typedef struct {
     char semantic[64];
@@ -29,8 +31,9 @@ typedef struct {
     uint8_t uav_kind[8];            // DXBC_UAV_*
     uint8_t uav_read[8];            // a typed UAV that is also read (needs read_write access)
     uint32_t uav_stride[8];         // structured element size
-    uint64_t srv_buffers;           // t# that are raw or structured buffers (bound as Metal buffers)
-    uint32_t srv_stride[64];
+    uint64_t srv_buffers[2];           // t# that are raw or structured buffers (bound as Metal buffers)
+    uint32_t srv_stride[DXBC_SRV_SLOTS];
+    uint8_t srv_binding[DXBC_SRV_SLOTS]; // Metal buffer index, or 0xff for unused logical slots
     uint32_t threads[3];            // [numthreads(x, y, z)]
     int uses_sizes;                 // reads buffer sizes (bufinfo, bounds) or UAV counters from buffer(DXBC_SIZES_BUFFER)
     uint8_t uav_counters;           // u# with a hidden counter (append, consume, IncrementCounter)
@@ -60,9 +63,10 @@ enum { DXBC_UAV_TYPED = 1, DXBC_UAV_RAW, DXBC_UAV_STRUCTURED };
 #define DXBC_GS_IN 28
 #define DXBC_GS_OUT 29
 #define DXBC_GS_COUNTS 26           // (the geometry kernel: triangles made per primitive)
-// bytes of u0..u7 then t0..t21, float4s of cb0..cb13 (DXBC_CB_SIZES on); GPU addresses
-typedef struct { uint32_t sizes[48]; uint64_t counters[8]; } dxbc_aux;
-#define DXBC_CB_SIZES 32
+// Bytes of u0..u7 then t0..t127, float4s of cb0..cb13; padded for aligned GPU addresses.
+#define DXBC_SRV_SIZES 8
+#define DXBC_CB_SIZES 136
+typedef struct { uint32_t sizes[152]; uint64_t counters[8]; } dxbc_aux;
 
 // Translates a DXBC container. Returns 0 and fills *out, or -1 with out->error set.
 int  dxbc_translate(const void *code, size_t size, dxbc_shader *out);

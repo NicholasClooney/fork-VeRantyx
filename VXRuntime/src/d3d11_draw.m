@@ -404,7 +404,7 @@ typedef struct d3d_draw_state {
     d3d_buffer *ib; uint32_t ib_format, ib_offset, topology;
     d3d_shader *shader[STAGES];
     d3d_buffer *cb[STAGES][14]; uint32_t cb_offset[STAGES][14];
-    d3d_view *srv[STAGES][32];
+    d3d_view *srv[STAGES][DXBC_SRV_SLOTS];
     d3d_sampler *smp[STAGES][16];
     d3d_view *uav[STAGES][8];                  // pixel shaders (with render targets) and compute shaders
     d3d_blend *blend; float blend_factor[4];
@@ -448,7 +448,7 @@ void d3d_draw_release(d3d_context *c) {
     for (int st = 0; st < STAGES; st++) {
         bind(&s->shader[st], NULL);
         for (int i = 0; i < 14; i++) bind(&s->cb[st][i], NULL);
-        for (int i = 0; i < 32; i++) bind(&s->srv[st][i], NULL);
+        for (int i = 0; i < DXBC_SRV_SLOTS; i++) bind(&s->srv[st][i], NULL);
         for (int i = 0; i < 16; i++) bind(&s->smp[st][i], NULL);
         for (int i = 0; i < 8; i++) bind(&s->uav[st][i], NULL);
     }
@@ -482,7 +482,7 @@ static WINAPI void vs_set_cbs(void *this, uint32_t start, uint32_t n, d3d_buffer
 static WINAPI void ps_set_cbs(void *this, uint32_t start, uint32_t n, d3d_buffer *const *b) { set_cbs(this, STAGE_PS, start, n, b); }
 static void set_srvs(d3d_context *c, int st, uint32_t start, uint32_t n, d3d_view *const *v) {
     d3d_draw_state *s = state_of(c);
-    for (uint32_t i = 0; i < n && start + i < 32; i++) bind(&s->srv[st][start + i], v ? v[i] : NULL);
+    for (uint32_t i = 0; start < DXBC_SRV_SLOTS && i < n && i < DXBC_SRV_SLOTS - start; i++) bind(&s->srv[st][start + i], v ? v[i] : NULL);
 }
 static WINAPI void vs_set_srvs(void *this, uint32_t start, uint32_t n, d3d_view *const *v) { set_srvs(this, STAGE_VS, start, n, v); }
 static WINAPI void ps_set_srvs(void *this, uint32_t start, uint32_t n, d3d_view *const *v) { set_srvs(this, STAGE_PS, start, n, v); }
@@ -1154,15 +1154,23 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
         if (!(sh->info.samplers & (1u << i))) continue;
         SET_SAMPLER(s->smp[st][i] ? (__bridge id<MTLSamplerState>)s->smp[st][i]->mtl : default_sampler(c), i);
     }
-    for (int i = 0; i < 22; i++) {                              // raw and structured buffer SRVs
-        if (!(sh->info.srv_buffers & (1ull << i))) continue;
+    for (int i = 0; i < DXBC_SRV_SLOTS; i++) {                    // raw and structured buffer SRVs
+        if (!(sh->info.srv_buffers[i / 64] & (1ull << (i % 64)))) continue;
+        unsigned slot = sh->info.srv_binding[i];
+        if (slot >= 31) continue;                               // unused or an invalid translation
         d3d_view *v = s->srv[st][i];
-        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, DXBC_SRV_BUFFER_BASE + i); continue; }
-        id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)v->resource)->mtl;
+        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, slot); continue; }
+        d3d_buffer *resource = (d3d_buffer *)v->resource;
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)resource->mtl;
         uint32_t stride = sh->info.srv_stride[i] ? sh->info.srv_stride[i] : 4;
-        NSUInteger off = (NSUInteger)v->first * stride;
-        SET_BUFFER(b, off, DXBC_SRV_BUFFER_BASE + i);
-        sizes[8 + i] = v->count ? v->count * stride : (uint32_t)(b.length - MIN(off, b.length));
+        NSUInteger first = (NSUInteger)v->first * stride;
+        // A dynamic buffer can occupy part of a larger Metal allocation. Neither its offset nor the
+        // bytes belonging to other resources in that allocation are part of the SRV's address space.
+        NSUInteger length = MIN((NSUInteger)resource->desc[0], b.length - MIN((NSUInteger)resource->off, b.length));
+        if (first >= length) { SET_BUFFER(nil, 0, slot); continue; }
+        NSUInteger available = length - first;
+        sizes[DXBC_SRV_SIZES + i] = (uint32_t)(v->count ? MIN((NSUInteger)v->count * stride, available) : available);
+        SET_BUFFER(b, resource->off + first, slot);
     }
     for (int i = 0; i < 8; i++) {                                // UAVs
         if (!(sh->info.uavs & (1u << i))) continue;
@@ -1402,7 +1410,7 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
         for (int k = 0; k < c->nclears && !reads; k++) {
             d3d_object *res = c->clears[k].v ? c->clears[k].v->resource : c->clears[k].res;
             for (int st = 0; st < STAGES && !reads; st++) {
-                for (int i = 0; i < 32 && !reads; i++) reads = s->srv[st][i] && s->srv[st][i]->resource == res;
+                for (int i = 0; i < DXBC_SRV_SLOTS && !reads; i++) reads = s->srv[st][i] && s->srv[st][i]->resource == res;
                 for (int i = 0; i < 8 && !reads; i++) reads = s->uav[st][i] && s->uav[st][i]->resource == res;
             }
         }
@@ -1598,7 +1606,7 @@ static int gs_inputs_from_cpu(d3d_context *c, d3d_draw_state *s) {
     static const int stages[2] = { STAGE_VS, STAGE_GS };
     for (int k = 0; k < 2; k++) {
         for (int i = 0; i < 14; i++) if (s->cb[stages[k]][i] && gpu_may_write(&s->cb[stages[k]][i]->base, sub)) GS_NOT_EARLY(k ? "GS constants" : "VS constants", i, &s->cb[stages[k]][i]->base);
-        for (int i = 0; i < 32; i++) if (s->srv[stages[k]][i] && gpu_may_write(s->srv[stages[k]][i]->resource, sub)) GS_NOT_EARLY(k ? "GS resource" : "VS resource", i, s->srv[stages[k]][i]->resource);
+        for (int i = 0; i < DXBC_SRV_SLOTS; i++) if (s->srv[stages[k]][i] && gpu_may_write(s->srv[stages[k]][i]->resource, sub)) GS_NOT_EARLY(k ? "GS resource" : "VS resource", i, s->srv[stages[k]][i]->resource);
     }
     #undef GS_NOT_EARLY
     return 1;
@@ -1904,7 +1912,7 @@ static void get_list(void *const *from, uint32_t start, uint32_t n, uint32_t lim
 #define STAGE_GETTERS(P, st) \
     static WINAPI void P##_get_shader(void *this, void **sh, void **ci, uint32_t *n) { (void)ci; *sh = held(state_of(this)->shader[st]); if (n) *n = 0; } \
     static WINAPI void P##_get_cbs(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->cb[st], start, n, 14, out); } \
-    static WINAPI void P##_get_srvs(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->srv[st], start, n, 32, out); } \
+    static WINAPI void P##_get_srvs(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->srv[st], start, n, DXBC_SRV_SLOTS, out); } \
     static WINAPI void P##_get_samplers(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->smp[st], start, n, 16, out); }
 STAGE_GETTERS(vs, STAGE_VS)
 STAGE_GETTERS(ps, STAGE_PS)

@@ -657,7 +657,7 @@ static int memory(gen *g, const operand *o, char *name, size_t cap, uint32_t *st
     *shared = 0; *stride = 0;
     uint32_t i = o->index[0];
     if (o->type == OPD_UAV && i < 8) { snprintf(name, cap, "u%u", i); *stride = g->sh->uav_stride[i]; return 1; }
-    if (o->type == OPD_RESOURCE && i < 64) { snprintf(name, cap, "t%u", i); *stride = g->sh->srv_stride[i]; return 1; }
+    if (o->type == OPD_RESOURCE && i < DXBC_SRV_SLOTS) { snprintf(name, cap, "t%u", i); *stride = g->sh->srv_stride[i]; return 1; }
     if (o->type == OPD_TGSM) {
         for (int k = 0; k < g->ntgsm; k++) if (g->tgsm[k].reg == i) *stride = g->tgsm[k].stride;
         snprintf(name, cap, "g%u", i); *shared = 1; return 1;
@@ -684,7 +684,7 @@ static void memory_access(gen *g, const instr *in) {
     // (outside the view: a load reads 0 and a store is dropped, as in Direct3D; Metal would read or write what lies
     //  beyond it. Group shared memory is not checked: outside it, Direct3D leaves it undefined too.)
     char limit[64] = "";
-    if (!shared) { snprintf(limit, sizeof limit, "(vx_sizes[%u] >> 2)", res->type == OPD_UAV ? res->index[0] : 8 + res->index[0]); g->sh->uses_sizes = 1; }
+    if (!shared) { snprintf(limit, sizeof limit, "(vx_sizes[%u] >> 2)", res->type == OPD_UAV ? res->index[0] : DXBC_SRV_SIZES + res->index[0]); g->sh->uses_sizes = 1; }
     line(g, "{ uint vx_a = %s;", addr);
     if (limit[0]) line(g, "  uint vx_n = %s;", limit);
     if (store) {
@@ -747,14 +747,18 @@ static void typed_uav(gen *g, const instr *in) {
 static void bufinfo(gen *g, const instr *in) {
     const operand *r = &in->ops[1];
     uint32_t i = r->index[0];
+    if ((r->type != OPD_UAV && r->type != OPD_RESOURCE) ||
+        i >= (r->type == OPD_UAV ? 8u : DXBC_SRV_SLOTS)) {
+        fail(g, "bufinfo resource slot %u is not supported", i); return;
+    }
     int comps[4], n = dest_comps(&in->ops[0], comps);
     char v[200], expr[300];
     if (r->type == OPD_UAV && (i & 7) == i && g->sh->uav_kind[i] == DXBC_UAV_TYPED) snprintf(v, sizeof v, "u%u.get_width()", i);
-    else if (r->type == OPD_RESOURCE && !(g->sh->srv_buffers & (1ull << (i & 63)))) snprintf(v, sizeof v, "t%u.get_width()", i);
+    else if (r->type == OPD_RESOURCE && !(g->sh->srv_buffers[i / 64] & (1ull << (i % 64)))) snprintf(v, sizeof v, "t%u.get_width()", i);
     else {
-        uint32_t stride = r->type == OPD_UAV ? g->sh->uav_stride[i & 7] : g->sh->srv_stride[i & 63];
+        uint32_t stride = r->type == OPD_UAV ? g->sh->uav_stride[i] : g->sh->srv_stride[i];
         g->sh->uses_sizes = 1;
-        snprintf(v, sizeof v, "(vx_sizes[%u]%s)", r->type == OPD_UAV ? i : 8 + i, stride ? "" : "");
+        snprintf(v, sizeof v, "(vx_sizes[%u]%s)", r->type == OPD_UAV ? i : DXBC_SRV_SIZES + i, stride ? "" : "");
         if (stride) { char t[250]; snprintf(t, sizeof t, "(%s / %uu)", v, stride); snprintf(v, sizeof v, "%s", t); }
     }
     snprintf(expr, sizeof expr, "%s(%s)", type_name(K_UINT, n), v);
@@ -818,7 +822,7 @@ static void atomic(gen *g, const instr *in) {
     if (!shared) {
         g->sh->uses_sizes = 1;
         line(g, "{ uint vx_a = %s;", a);
-        line(g, "if (vx_a < (vx_sizes[%u] >> 2)) {", res->type == OPD_UAV ? res->index[0] : 8 + res->index[0]);
+        line(g, "if (vx_a < (vx_sizes[%u] >> 2)) {", res->type == OPD_UAV ? res->index[0] : DXBC_SRV_SIZES + res->index[0]);
         g->indent++;
         snprintf(a, sizeof a, "vx_a");
     }
@@ -1280,13 +1284,39 @@ static void declare(gen *g, uint32_t op, uint32_t token, reader *r, pool *pl) {
     }
     case OP_DCL_RESOURCE_RAW: case OP_DCL_RESOURCE_STRUCTURED:
         read_operand(r, pl, &o);
-        if (o.index[0] < 22) {
-            g->sh->srv_buffers |= 1ull << o.index[0];
+        if (o.index[0] < DXBC_SRV_SLOTS) {
+            g->sh->srv_buffers[o.index[0] / 64] |= 1ull << (o.index[0] % 64);
             g->sh->srv_stride[o.index[0]] = op == OP_DCL_RESOURCE_STRUCTURED ? next(r) : 0;
-        } else fail(g, "buffer t%u: only t0..t21 are supported", o.index[0]);
+        } else fail(g, "buffer t%u: only t0..t127 are supported", o.index[0]);
         break;
     default: break;                                          // flags, index ranges and the like change nothing here
     }
+}
+
+// Raw/structured SRVs borrow only buffer indices unused by the stage's fixed bindings.
+// Both vertex variants share this map, so vertex input and geometry-kernel slots stay reserved.
+static void map_srv_buffers(gen *g) {
+    dxbc_shader *sh = g->sh;
+    uint32_t reserved = sh->cbuffers | (0xffu << DXBC_UAV_BUFFER_BASE) | (1u << DXBC_SIZES_BUFFER);
+    if (sh->type == DXBC_VERTEX) reserved |= 0xffffu << 14;
+    if (sh->type == DXBC_GEOMETRY) reserved |= 0xfu << DXBC_GS_COUNTS;
+    for (int i = 0; i < DXBC_SRV_SLOTS; i++) {
+        if (!(sh->srv_buffers[i / 64] & (1ull << (i % 64)))) continue;
+        int binding = -1;
+        for (int b = DXBC_SRV_BUFFER_BASE; b < DXBC_SIZES_BUFFER; b++)
+            if (!(reserved & (1u << b))) { binding = b; break; }
+        if (binding < 0) for (int b = 0; b < DXBC_UAV_BUFFER_BASE; b++)
+            if (!(reserved & (1u << b))) { binding = b; break; }
+        if (binding < 0) { fail(g, "buffer t%d: Metal buffer binding budget exhausted", i); return; }
+        sh->srv_binding[i] = (uint8_t)binding;
+        reserved |= 1u << binding;
+    }
+}
+static int gs_srv_conflict(const dxbc_shader *sh) {
+    for (int i = 0; i < DXBC_SRV_SLOTS; i++)
+        if ((sh->srv_buffers[i / 64] & (1ull << (i % 64))) &&
+            sh->srv_binding[i] >= DXBC_GS_COUNTS) return 1;
+    return 0;
 }
 
 // ---- the whole program ----------------------------------------------------------------------------------------------------------
@@ -1331,7 +1361,8 @@ static void resource_params(gen *g, text *t) {
         put(t, ", %s<%s> t%d [[texture(%d)]]", tt, g->tex_cmp[i] ? "float" : rt, i, i);
     }
     for (int i = 0; i < 32; i++) if (sh->samplers & (1u << i)) put(t, ", sampler s%d [[sampler(%d)]]", i, i);
-    for (int i = 0; i < 22; i++) if (sh->srv_buffers & (1ull << i)) put(t, ", const device uint *t%d [[buffer(%d)]]", i, DXBC_SRV_BUFFER_BASE + i);
+    for (int i = 0; i < DXBC_SRV_SLOTS; i++) if (sh->srv_buffers[i / 64] & (1ull << (i % 64)))
+        put(t, ", const device uint *t%d [[buffer(%d)]]", i, sh->srv_binding[i]);
     for (int i = 0; i < 8; i++) {
         if (!(sh->uavs & (1u << i))) continue;
         if (sh->uav_kind[i] != DXBC_UAV_TYPED) { put(t, ", device uint *u%d [[buffer(%d)]]", i, DXBC_UAV_BUFFER_BASE + i); continue; }
@@ -1350,7 +1381,7 @@ static void locals(gen *g, text *t) {
 static void preamble(gen *g, text *t) {
     put(t, "#include <metal_stdlib>\nusing namespace metal;\n\n");
     if (g->sh->uav_counters)
-        put(t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + 48)).c[u])\n\n");
+        put(t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + %zu)).c[u])\n\n", offsetof(dxbc_aux, counters) / sizeof(uint32_t));
     if (g->uses_msad)
         put(t, "template <typename T> T vx_msad(T r, T s, T a) {\n"
                "    for (uint i = 0; i < 32; i += 8) { T rb = (r >> i) & 0xffu, sb = (s >> i) & 0xffu; a += select(T(0u), absdiff(rb, sb), rb != 0u); }\n"
@@ -1649,6 +1680,7 @@ static int run(gen *g, const uint32_t *p) {
 
 int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
     memset(out, 0, sizeof *out);
+    memset(out->srv_binding, 0xff, sizeof out->srv_binding);
     uint32_t len;
     const uint8_t *prog = chunk(code, size, "SHEX", &len);
     if (!prog) prog = chunk(code, size, "SHDR", &len);
@@ -1699,6 +1731,7 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
     }
     g.prog_end = tok + count;
     int bad = run(&g, tok + 2);
+    if (!g.why[0] && !bad) map_srv_buffers(&g);
     if (g.why[0] || bad) {
         snprintf(out->error, sizeof out->error, "%s", g.why[0] ? g.why : "truncated program");
         free(g.body.s); free(g.icb);
@@ -1712,7 +1745,7 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
         out->gs_instances = g.gs_instances ? (int)g.gs_instances : 1;
         const char *why = !out->gs_in_verts ? "its input primitive" : g.gs_topology != 5 ? "an output other than triangle strips" :
                           !out->gs_max_tris ? "no triangles" : out->gs_instances > 1 ? "instancing" :
-                          (out->srv_buffers >> (DXBC_GS_COUNTS - DXBC_SRV_BUFFER_BASE)) ? "buffers at the slots the geometry path uses" : NULL;
+                          gs_srv_conflict(out) ? "buffers at the slots the geometry path uses" : NULL;
         if (why) { snprintf(out->error, sizeof out->error, "geometry shader with %s is not supported yet", why); free(g.body.s); free(g.icb); return -1; }
         out->msl = compose_gs(&g, out->gs_max_tris);
         out->msl_passthrough = compose_passthrough(&g, out->gs_max_tris);

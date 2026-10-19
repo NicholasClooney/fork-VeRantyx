@@ -325,7 +325,7 @@ build/vxplugin.dll: tests/vxplugin.c tests/vxplugin.def
 # Test shaders: HLSL compiled to DXBC by a d3dcompiler DLL (Microsoft's, as games ship it) running on vxrt.
 # The generated tests/shaders/*.h are kept in the repository; regenerate with
 #   make shaders D3DCOMPILER='Z:\path\to\d3dcompiler_43.dll'
-SHADERS = color_vs:vs_4_0 color_ps:ps_4_0 tex_vs:vs_4_0 tex_ps:ps_4_0 fullscreen_vs:vs_4_0 math_ps:ps_4_0 sum_cs:cs_5_0 atomic_cs:cs_5_0 append_cs:cs_5_0 views_cs:cs_5_0 formats_cs:cs_5_0 features_ps:ps_5_0 features_vs:vs_5_0 features_cs:cs_5_0 quad_gs:gs_4_0 bounds_cs:cs_5_0 cbounds_cs:cs_5_0
+SHADERS = color_vs:vs_4_0 color_ps:ps_4_0 tex_vs:vs_4_0 tex_ps:ps_4_0 fullscreen_vs:vs_4_0 math_ps:ps_4_0 sum_cs:cs_5_0 atomic_cs:cs_5_0 append_cs:cs_5_0 views_cs:cs_5_0 formats_cs:cs_5_0 features_ps:ps_5_0 features_vs:vs_5_0 features_cs:cs_5_0 quad_gs:gs_4_0 bounds_cs:cs_5_0 cbounds_cs:cs_5_0 high_srv_vs:vs_5_0 high_srv_ps:ps_5_0 high_srv_cs:cs_5_0 high_srv_gs:gs_5_0 high_srv_budget_vs:vs_5_0
 shaders: build/vxrt build/hlslc.exe
 	@for s in $(SHADERS); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/hlslc.exe '$(D3DCOMPILER)' tests/shaders/$$n.hlsl main $$p tests/shaders/$$n.h $$n || exit 1; done
@@ -366,6 +366,7 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	$(MAKE) wait-diagnostic-check
 	$(MAKE) atomic-texture-check
 	$(MAKE) dxbc-failure-diag-check
+	$(MAKE) high-srv-check
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -408,7 +409,8 @@ runtime-tests: $(VXRT) tests
 	python3 tests/shoplist_check.py $(VXRT)
 	$(VXRT) build/d3d11.exe
 	$(VXRT) build/gl.exe
-	build/dxbcscan tests/shaders/*.dxbc
+	# The budget fixture must fail translation; high-srv-check verifies that rejection.
+	build/dxbcscan $(filter-out tests/shaders/high_srv_budget_vs.dxbc,$(wildcard tests/shaders/*.dxbc))
 	$(VXRT) build/draw.exe
 	$(VXRT) build/compute.exe
 	$(VXRT) build/d3d12.exe
@@ -551,3 +553,17 @@ build/dxbc_failure_diag: tests/dxbc_failure_diag.c src/dxbc.c src/dxbc.h
 
 dxbc-failure-diag-check: build/dxbc_failure_diag
 	build/dxbc_failure_diag
+
+.PHONY: high-srv-check
+HIGH_SRV_HEADERS = $(wildcard tests/shaders/high_srv*.h)
+build/high_srv.exe: tests/high_srv.c $(HIGH_SRV_HEADERS)
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxguid
+
+build/high_srv_translate: tests/high_srv_translate.c src/dxbc.c src/dxbc.h $(HIGH_SRV_HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/high_srv_translate.c src/dxbc.c
+
+high-srv-check: build/high_srv.exe build/high_srv_translate $(VXRT)
+	build/high_srv_translate
+	MTL_DEBUG_LAYER=1 VXRT_NO_WINE=1 VXRT_NO_ACTIVATE=1 VXRT_ROOT=build/high-srv-root $(VXRT) build/high_srv.exe
