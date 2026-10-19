@@ -211,3 +211,55 @@ that flag from the returned usage value. Actual GPU operations and readback are 
 
 The integrated change passed all six native-assertion parser tests, the explicit Metal-validation texture fixtures,
 and a complete `make -C VXRuntime check`. Existing game `vr-check` and the next ED harness run are not yet complete.
+
+
+### Late Presents and shader-creation failure
+
+`20261019T172253Z-elite-keyboard-diagnostic` connects after 17.5 seconds (`o2`, `d3`), and records no recognized
+native Metal descriptor assertion (`o23=null`). This run does not reproduce the previous R32Float assertion.
+The final stream is still the SteamVR waiting background (`o12`, `o13`), not verified ED rendering.
+
+At 90/100/110 seconds, `o21` records completed drawable Presents of 1200/2193/2639 and main command-buffer commits
+of 1529/2523/2968. These advance, unlike the earlier 87-Present plateau. `o22` identifies thread 5 as the last
+Present thread: its samples show completed WakeConditionVariable, active Present in next_drawable, then the known
+10ms shared-mode condition wait. The subsequent completed Presents rule out treating the middle snapshot as a
+permanent Present block. Counts aggregate all covered APIs, and overflow remains true. DXGI window presentation
+is not OpenVR Submit; actual eye submission and the contents of the game window remain unobserved.
+
+The unhandled exception (`o14=1`, `o18`, selected log line 324) occurs at 17:24:53.136 UTC, 119.666677 seconds after
+the recorded start and approximately 333ms before the harness deadline. SteamVR also records the game exiting
+before that deadline. The launcher waits for SteamVR cleanup after the game exits, so its continued presence can
+produce `o1=false` and `d4=true`; neither establishes an exception-free game scenario. This is not established as
+a harness teardown artifact.
+
+Read-only analysis of the selected game image finds an explicit zero-address write at `main_image+0x34c9322`.
+The recorded caller chain passes through shader creation's failed-HRESULT branch and a fatal error handler.
+Immediately before the exception, log line 307 reports `shader not translated: buffer t33: only t0..t21 are
+supported`. The runtime returns E_INVALIDARG for this translation failure. The fatal stack establishes a shader
+creation failure, but without a stage or call identity it does not prove that this particular log entry is the
+same failed call. It also does not explain the earlier waiting-background captures by itself.
+
+The t33 diagnostic comes from a raw/structured SRV declaration. Simply raising the slot limit is unsafe: the
+existing logical-to-Metal buffer layout, auxiliary size table, stage-internal slots and runtime SRV state have
+separate bounds. The next bounded investigation records the failed shader stage and complete resource-declaration
+summary before choosing a sparse binding remap or identifying a larger binding-budget limitation. No synchronization
+semantics change or successful ED scene rendering is inferred from this run.
+
+
+Shader translation failures now append one fixed metadata line: requested/bytecode stage, E_INVALIDARG, SHA-256,
+and seven resource-class slot masks with unique-slot counts. The independent declaration scan continues beyond
+where translation failed; malformed, unsupported or over-budget input is explicitly incomplete, never a complete
+resource inventory. Input hashing/scanning is limited to 1MiB and 64 chunks. No shader payload, original source
+text, game file, successful translation or error return is changed. Complete means declaration-scan completion,
+not shader semantic validity; thread/call identity is not added by this diagnostic.
+
+The synthetic fixture covers high slots and later declarations, all seven classes, duplicate slots, truncations,
+malformed lengths, unsupported indexing, nonaligned input and 20,000 deterministic mutations. It also compares
+translation results and source bytes before/after diagnosis and scans repository-owned shader fixtures. The
+focused x86 test and native UBSan run passed; ASan runs did not complete successfully and are not claimed as
+validation. A new game run is required to establish the failing stage/resource budget; no t33 compatibility fix
+has been implemented yet.
+
+The integrated failure diagnostic passed `make -C VXRuntime check`, including its new fixture. The next authorized
+harness run should retain 90/100/110-second sampling and extend the scenario to 180 seconds so a near-120-second
+game exit is observed away from the harness deadline. Real-game failure metadata remains pending.

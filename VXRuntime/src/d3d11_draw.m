@@ -136,12 +136,36 @@ static void shader_stats(uint64_t translate_ns, uint64_t compile_ns) {
     if (count % 500 == 0) vx_log("Direct3D: %llu shaders: %llu ms translating, %llu ms compiling", (unsigned long long)count,
                                  (unsigned long long)(t / 1000000), (unsigned long long)(k / 1000000));
 }
+static void shader_failure_diag(const void *code, size_t size, int want) {
+    static const char *stages[] = { "pixel", "vertex", "geometry", "hull", "domain", "compute" };
+    static const char *status[] = { "complete", "incomplete_malformed", "incomplete_unsupported", "incomplete_limit" };
+    static const char *kinds[] = { "cb", "raw", "structured", "typed", "uav_raw", "uav_structured", "uav_typed" };
+    dxbc_resource_diag d;
+    dxbc_resource_summary(code, size, &d);
+    char hash[65] = "unavailable_limit";
+    if (code && size <= DXBC_DIAG_MAX_BYTES) {
+        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(code, (CC_LONG)size, digest);
+        for (unsigned i = 0; i < sizeof digest; i++) snprintf(hash + i * 2, 3, "%02x", digest[i]);
+    }
+    // Fixed metadata only; masks are high:low, with bit n identifying logical slot n. No bytecode dump.
+    char slots[640]; size_t used = 0;
+    for (int i = 0; i < DXBC_DIAG_KINDS; i++) {
+        used += (size_t)snprintf(slots + used, sizeof slots - used, "%s%s=%u:%016llx:%016llx",
+            i ? " " : "", kinds[i], (unsigned)(__builtin_popcountll(d.slots[i][0]) + __builtin_popcountll(d.slots[i][1])),
+            (unsigned long long)d.slots[i][1], (unsigned long long)d.slots[i][0]);
+    }
+    vx_log("Direct3D: shader failure requested=%s stage=%s hr=0x%08x sha256=%s resources=%s %s",
+        want >= 0 && want < 6 ? stages[want] : "unknown", d.stage >= 0 && d.stage < 6 ? stages[d.stage] : "unknown",
+        (unsigned)E_INVALIDARG, hash, status[d.status], slots);
+}
 static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int want, void **vtbl, void **out) {
     d3d_shader *s = d3d_alloc(sizeof *s, K_SHADER, vtbl, dev);
     s->base.destroy = shader_destroy;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (dxbc_translate(code, size, &s->info) || s->info.type != want) {
         vx_log("Direct3D: shader not translated: %s", s->info.error[0] ? s->info.error : "wrong shader type");
+        shader_failure_diag(code, size, want);
         d3d_release(&s->base);
         return E_INVALIDARG;
     }

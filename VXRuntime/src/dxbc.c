@@ -182,6 +182,82 @@ static void read_operand(reader *r, pool *pl, operand *o) {
     }
 }
 
+// A bounded declaration-only pass for failures. Do not use chunk(): this pass must also accept truncated
+// containers safely. Copy each instruction to aligned storage before reusing the operand reader.
+static uint32_t diag_word(const uint8_t *p) { uint32_t v; memcpy(&v, p, sizeof v); return v; }
+void dxbc_resource_summary(const void *code, size_t size, dxbc_resource_diag *out) {
+    memset(out, 0, sizeof *out);
+    out->stage = -1; out->status = DXBC_DIAG_MALFORMED;
+    if (size > DXBC_DIAG_MAX_BYTES) { out->status = DXBC_DIAG_LIMIT; return; }
+    const uint8_t *c = code, *prog = NULL;
+    if (!c || size < 32 || memcmp(c, "DXBC", 4)) return;
+    uint32_t total = diag_word(c + 24), chunks = diag_word(c + 28), bytes = 0;
+    if (total != size || diag_word(c + 20) != 1 || chunks > (size - 32) / 4) return;
+    if (chunks > 64) { out->status = DXBC_DIAG_LIMIT; return; }
+    for (uint32_t i = 0; i < chunks; i++) {
+        uint32_t off = diag_word(c + 32 + 4 * i);
+        if (off < 32 + 4 * chunks || off > size || size - off < 8) return;
+        uint32_t n = diag_word(c + off + 4);
+        if (n > size - off - 8) return;
+        if (!memcmp(c + off, "SHEX", 4) || !memcmp(c + off, "SHDR", 4)) {
+            if (prog) return;                               // ambiguous program selection
+            prog = c + off + 8; bytes = n;
+        }
+    }
+    if (!prog || bytes < 8 || bytes % 4) return;
+    uint32_t version = diag_word(prog), words = diag_word(prog + 4);
+    if (words != bytes / 4) return;
+    out->stage = (int)(version >> 16);
+    if (out->stage > 5 || ((version >> 4) & 15) < 4 || ((version >> 4) & 15) > 5 || (version & 15)) {
+        out->status = DXBC_DIAG_UNSUPPORTED; return;
+    }
+    for (uint32_t at = 2; at < words;) {
+        uint32_t token = diag_word(prog + at * 4), op = token & 0x7ff, n = (token >> 24) & 127;
+        if (op == OP_CUSTOMDATA) {
+            if (words - at < 2) return;
+            n = diag_word(prog + (at + 1) * 4);
+            if (n < 2 || n > words - at) return;
+            at += n; continue;
+        }
+        if (!n || n > words - at) return;
+        if (op > OP_UTOD) { out->status = DXBC_DIAG_UNSUPPORTED; return; }
+        uint32_t ins[127]; memcpy(ins, prog + at * 4, n * 4);
+        reader r = { ins + 1, ins + n, 0 };
+        uint32_t ext = token;
+        while ((ext & 0x80000000u) && !r.bad) ext = next(&r);
+        if (r.bad) return;
+        int kind = -1, type = OPD_RESOURCE, dims = 1, tail = 0;
+        switch (op) {
+        case OP_DCL_CONSTANT_BUFFER: kind = DXBC_DIAG_CB; type = OPD_CB; dims = 2; break;
+        case OP_DCL_RESOURCE_RAW: kind = DXBC_DIAG_RAW; break;
+        case OP_DCL_RESOURCE_STRUCTURED: kind = DXBC_DIAG_STRUCTURED; tail = 1; break;
+        case OP_DCL_RESOURCE: kind = DXBC_DIAG_TYPED; tail = 1; break;
+        case OP_DCL_UAV_RAW: kind = DXBC_DIAG_UAV_RAW; type = OPD_UAV; break;
+        case OP_DCL_UAV_STRUCTURED: kind = DXBC_DIAG_UAV_STRUCTURED; type = OPD_UAV; tail = 1; break;
+        case OP_DCL_UAV_TYPED: kind = DXBC_DIAG_UAV_TYPED; type = OPD_UAV; tail = 1; break;
+        }
+        if (kind >= 0) {
+            if (r.p == r.end) return;
+            uint32_t operand_token = *r.p;
+            if (((operand_token >> 12) & 255) != (uint32_t)type || ((operand_token >> 20) & 3) != (uint32_t)dims) return;
+            // Declarations need immediate slots. Reject relative/64-bit forms before the recursive reader.
+            for (int d = 0; d < dims; d++) if ((operand_token >> (22 + d * 3)) & 7) {
+                out->status = DXBC_DIAG_UNSUPPORTED; return;
+            }
+            if (operand_token & 0x80000000u) { out->status = DXBC_DIAG_UNSUPPORTED; return; }
+            pool pl = { .used = 0 }; operand o;
+            read_operand(&r, &pl, &o);
+            if (tail) next(&r);
+            if (r.bad || r.p != r.end) return;
+            uint32_t slot = o.index[0], limit = type == OPD_CB ? 14 : type == OPD_UAV ? 8 : 128;
+            if (slot >= limit) { out->status = DXBC_DIAG_UNSUPPORTED; return; }
+            out->slots[kind][slot / 64] |= 1ull << (slot % 64);
+        }
+        at += n;
+    }
+    out->status = DXBC_DIAG_COMPLETE;
+}
+
 // ---- generation state ------------------------------------------------------------------------------------------------------------
 typedef struct {
     dxbc_shader *sh;

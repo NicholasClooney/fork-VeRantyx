@@ -71,4 +71,12 @@ void dxbc_free(dxbc_shader *s);
 int  dxbc_input_signature(const void *code, size_t size, dxbc_element *elements, int max);
 // The program type of a container (DXBC_VERTEX, ...), or -1.
 int  dxbc_program_type(const void *code, size_t size);
+// Failure diagnostics only: slot masks, never shader payload. Complete means the resource declaration scan
+// reached the end, not that the instructions form a valid shader. Unsupported forms retain a partial summary.
+enum { DXBC_DIAG_CB, DXBC_DIAG_RAW, DXBC_DIAG_STRUCTURED, DXBC_DIAG_TYPED,
+       DXBC_DIAG_UAV_RAW, DXBC_DIAG_UAV_STRUCTURED, DXBC_DIAG_UAV_TYPED, DXBC_DIAG_KINDS };
+enum { DXBC_DIAG_COMPLETE, DXBC_DIAG_MALFORMED, DXBC_DIAG_UNSUPPORTED, DXBC_DIAG_LIMIT };
+#define DXBC_DIAG_MAX_BYTES (1024u * 1024u)
+typedef struct { int stage, status; uint64_t slots[DXBC_DIAG_KINDS][2]; } dxbc_resource_diag;
+void dxbc_resource_summary(const void *code, size_t size, dxbc_resource_diag *out);
 #endif

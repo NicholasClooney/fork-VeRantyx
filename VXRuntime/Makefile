@@ -365,6 +365,7 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	$(MAKE) cpu-diagnostic-check
 	$(MAKE) wait-diagnostic-check
 	$(MAKE) atomic-texture-check
+	$(MAKE) dxbc-failure-diag-check
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -542,3 +543,11 @@ build/atomic_texture_metal: tests/atomic_texture_metal.m
 atomic-texture-check: build/atomic_texture.exe build/atomic_texture_metal $(VXRT)
 	MTL_DEBUG_LAYER=1 build/atomic_texture_metal
 	MTL_DEBUG_LAYER=1 VXRT_NO_WINE=1 VXRT_NO_ACTIVATE=1 VXRT_ROOT=build/atomic-texture-root $(VXRT) build/atomic_texture.exe
+
+.PHONY: dxbc-failure-diag-check
+build/dxbc_failure_diag: tests/dxbc_failure_diag.c src/dxbc.c src/dxbc.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/dxbc_failure_diag.c src/dxbc.c
+
+dxbc-failure-diag-check: build/dxbc_failure_diag
+	build/dxbc_failure_diag
