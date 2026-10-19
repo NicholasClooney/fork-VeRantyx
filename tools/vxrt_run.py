@@ -412,7 +412,7 @@ def validate(result):
             config = result.get("wait_diagnostic", {})
             if (saved != rows or config.get("artifact") != o["artifact"] or config.get("sha256") != o.get("sha256")
                 or config.get("enabled") is not True or config.get("mode") != "wait_snapshot"
-                or config.get("max_samples") != 3 or config.get("schedule_seconds") != [30, 40, 50]
+                or config.get("max_samples") != 3 or not valid_diagnostic_schedule(config.get("schedule_seconds"))
                 or config.get("max_response_bytes") != 131072 or config.get("text_capture") is not False
                 or config.get("read_only") is not True or config.get("child_excluded") is not True
                 or config.get("target_selector") != "exact_realpath_main_process"
@@ -548,6 +548,14 @@ def validate_wait_snapshot(value):
         threads.append(dict({k: row[k] for k in ("thread", "entered", "completed", "active", "truncated")}, frames=frames))
     return dict({k: value[k] for k in ("status", "scope", "openvr_submit", "object_identity", "max_threads",
                                       "max_depth", "overflow", "last_present_thread")}, threads=threads)
+
+def valid_diagnostic_schedule(value):
+    if (not isinstance(value, list) or len(value) != 3
+        or any(type(t) not in (int, float) or not math.isfinite(t) for t in value)
+        or not 30 <= value[0] <= 3630):
+        return False
+    return all(math.isclose(t - value[0], delta, rel_tol=0, abs_tol=1e-9)
+               for t, delta in zip(value, (0, 10, 20)))
 
 def valid_wait_samples(rows):
     if not isinstance(rows, list) or len(rows) > 3:

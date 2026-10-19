@@ -51,7 +51,10 @@ static unsigned token(uintptr_t object) {
     return i + 1;
 }
 void vx_waitdiag_enable(void) {
-    int saved = errno; DWORD error = vx_get_last_error();
+    int saved = errno;
+    // This runs on the native UI thread before guest startup. Reading Windows last-error
+    // would attach a TEB and overwrite Darwin's localtime TSD slot with the shared PEB.
+    // Only native operations follow, so Windows last-error is already untouched.
     // Startup-only, before guest execution. Do not reset slots if called again.
     if (strcmp(status, "off")) goto finished;
 #ifndef __x86_64__
@@ -63,7 +66,7 @@ void vx_waitdiag_enable(void) {
     atomic_store_explicit(&enabled, 1, memory_order_release);
 #endif
 finished:
-    vx_set_last_error(error); errno = saved;
+    errno = saved;
 }
 vx_waitdiag_scope vx_waitdiag_begin(const char *api, uintptr_t object, uint32_t timeout, uintptr_t caller) {
     (void)timeout; // Deliberately omit arguments from this first metadata schema.

@@ -5,10 +5,11 @@
 #include <string.h>
 #include "../src/waitdiag.c"
 static __thread DWORD last_error;
+static __thread unsigned error_accesses;
 vx_process vx_proc;
 static vx_image mock_image;
-DWORD vx_get_last_error(void) { return last_error; }
-void vx_set_last_error(DWORD value) { last_error=value; }
+DWORD vx_get_last_error(void) { error_accesses++; return last_error; }
+void vx_set_last_error(DWORD value) { error_accesses++; last_error=value; }
 const vx_image *vx_image_at(uint64_t pc) {
     return pc >= (uintptr_t)mock_image.base && pc-(uintptr_t)mock_image.base < mock_image.size ? &mock_image : NULL;
 }
@@ -25,13 +26,14 @@ static void *worker(void *unused) {
 static void *one_thread(void *unused) { (void)unused; VX_WAITDIAG_SCOPE("Sleep",0,0); return NULL; }
 int main(int argc, char **argv) {
     if(argc>1 && !strcmp(argv[1],"conflict")) {
-        setenv("VXRT_TRACE_CALLS","1",1); vx_waitdiag_enable();
+        setenv("VXRT_TRACE_CALLS","1",1); vx_waitdiag_enable(); assert(!error_accesses);
         assert(!vx_waitdiag_begin("Sleep",0,0,0).slot);
         char *json=vx_waitdiag_snapshot(); assert(strstr(json,"\"status\":\"conflict\"")); free(json); return 0;
     }
     assert(!vx_waitdiag_begin("Sleep",0,0,0).slot);
     char *json=vx_waitdiag_snapshot(); assert(json && strstr(json,"\"status\":\"off\"")); free(json);
-    errno=EPERM;last_error=456;vx_waitdiag_enable();assert(errno==EPERM && last_error==456);
+    errno=EPERM;last_error=456;unsigned before_enable=error_accesses;vx_waitdiag_enable();
+    assert(error_accesses==before_enable && errno==EPERM && last_error==456);
     vx_waitdiag_scope outer=vx_waitdiag_begin("WaitForSingleObject",0x1234,1,0x1010);
     vx_waitdiag_phase("test_outer");vx_waitdiag_present();
     vx_waitdiag_scope inner=vx_waitdiag_begin("Sleep",0,1,0x2020);

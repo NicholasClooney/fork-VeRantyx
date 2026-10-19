@@ -13,6 +13,10 @@ int main(void) {
     Sleep(50);
     puts("waitdiag guest ready");fflush(stdout);
     Sleep(8000);
+    unsigned char *peb;
+    __asm__ volatile("movq %%gs:0x60, %0" : "=r"(peb));
+    assert(peb && *(void **)(peb+0x20));
+    assert(*(DWORD *)(*(unsigned char **)(peb+0x20)+8)==1);
     assert(SetEvent(event));assert(WaitForSingleObject(thread,2000)==WAIT_OBJECT_0);
     CloseHandle(thread);CloseHandle(event);return 0;
 }

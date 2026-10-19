@@ -40,6 +40,11 @@ class Live(unittest.TestCase):
             if not render:
                 identities=[[(t['thread'],t['frames'][0]['started_ns']) for t in row['wait']['threads'] if t['active'] and t['frames'][0]['api']=='WaitForSingleObject'] for row in rows]
                 self.assertEqual(identities[0],identities[1]);self.assertEqual(identities[1],identities[2])
+                # Exhaust the separate metadata budget too, so the native server thread exits.
+                for _ in range(3):self.assertEqual(m.sample()['status'],'ok')
+                remaining=p.communicate(timeout=12)[0]
+                self.assertEqual(p.returncode,0,remaining.decode(errors='replace'))
+                self.assertFalse(os.path.exists(m.path))
         finally:
             if p:
                 if p.poll() is None:p.terminate()

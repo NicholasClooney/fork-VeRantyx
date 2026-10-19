@@ -27,6 +27,23 @@ def snapshot():
 
 
 class WaitDiagnostic(unittest.TestCase):
+    def test_stopped_before_first_delayed_sample(self):
+        m=h.WindowMetadata(False,wait=True,delay=60)
+        stop=threading.Event();stop.set();m.collect(stop,0)
+        self.assertEqual(m.wait_config['status'],'stopped')
+        self.assertEqual(m.wait_rows,[])
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence=h.Evidence();m.seal(tmp,evidence)
+            result=dict(observed=evidence.observed,wait_diagnostic=m.wait_config,game='unused',scenario='start')
+            with patch.object(h,'baseline_for',return_value=(None,None,None)),patch.object(h,'derive'):
+                self.assertEqual(h.validate(result),[])
+                for schedule in ([90,100,111],[True,40,50],[0,10,20],[3631,3641,3651],[30,float('inf'),50]):
+                    result['wait_diagnostic']['schedule_seconds']=schedule
+                    self.assertIn('wait_diagnostic_samples: artifact/config mismatch',h.validate(result))
+                result['wait_diagnostic']['schedule_seconds']=[90,100,110]
+                result['wait_diagnostic']['request_count']=1
+                self.assertIn('wait_diagnostic_samples: artifact/config mismatch',h.validate(result))
+
     def test_delayed_schedule_is_recorded(self):
         m=h.WindowMetadata(True,True,False,True,delay=60)
         self.assertEqual(m.schedule,(90,100,110))

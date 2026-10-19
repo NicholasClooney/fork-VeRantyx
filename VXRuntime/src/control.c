@@ -251,6 +251,8 @@ static void *metadata_serve(void *arg) {
     }
     close(ls);
     metadata_cleanup();
+    // Snapshot helpers may attach a TEB to this native thread; restore its GS/TSD exit invariant.
+    vx_thread_detach();
     return NULL;
 }
 void vx_control_metadata_start(const char *exe) {

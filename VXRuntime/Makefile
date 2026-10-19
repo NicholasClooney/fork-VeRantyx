@@ -525,3 +525,7 @@ wait-diagnostic-check: build/waitdiag_host build/waitdiag_sync_host build/waitdi
 	build/waitdiag_sync_host
 	python3 tests/wait_diagnostic_check.py
 	python3 tests/waitdiag_live_check.py
+
+# Optional native ABI probe; deliberately does not run game or runtime code.
+build/peb_native_probe: tests/peb_native_probe.c
+	$(CC) $(CFLAGS) -pthread -o $@ $<

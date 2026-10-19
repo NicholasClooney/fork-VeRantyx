@@ -141,3 +141,40 @@ regression against the earlier run.
 
 The delayed-schedule change passed its schedule/bounds test and a complete `make -C VXRuntime check` execution,
 including the D3D12 query test on that execution. The intermittent timestamp issue is not considered fixed.
+
+### Early-exit follow-up and diagnostic startup repair
+
+`20261019T170418Z-elite-keyboard-diagnostic` was refused (`user_not_playing`) and measured nothing. The coordinator
+reported its shell command line contained the `pgrep` pattern; subsequent process checks were issued separately.
+The next run, `20261019T170427Z-elite-keyboard-diagnostic`, exited early (`o1`) without a Scene connection (`o2`,
+`d3=false`), with an unhandled access violation (`o14`, `o18`) at `main_image+0x48c6442`. No metadata/render/wait
+samples were taken (`o20`–`o22`); the first was scheduled at 90 seconds. Read-only static analysis identifies the
+faulting instruction as reading ProcessParameters.Flags after GS:0x60 → PEB → PEB+0x20. The log has no register
+values to distinguish a null pointer from corruption. The final unknown stack entry is an unmapped address, not a
+game RVA. Network call paths also differed from the previous run; this does not establish network causality.
+
+The delayed schedule exposed a validator bug: it still required exactly 30/40/50 seconds. It now validates the
+bounded shifted three-sample schedule, including a stopped run with zero samples, while retaining artifact hashes,
+counts and schema checks. Revalidation of the original result passes without rewriting its sealed files or its
+recorded historical validation message.
+
+Investigation also found a diagnostic startup side effect. `vx_waitdiag_enable` used Windows last-error accessors,
+which attach a TEB to the native UI thread and replace Darwin TSD slot 12 (GS:0x60) with the shared PEB before guest
+startup. A standalone native probe on this Mac demonstrated that `localtime()` uses this pointer as its buffer and
+changes the simulated PEB's ProcessParameters pointer; the `localtime_r()` control leaves it intact. The probe
+restores the original slot before cleanup and never follows the corrupted pointer. This proves a mechanism, not
+that ED's failing run executed `localtime()` there.
+
+Enable now preserves only errno: its native-only body never changes Windows last-error, so it does not need to
+attach a TEB. A regression requiring zero Windows error-accessor calls fails before and passes after this change.
+Separately, the metadata server now detaches any TEB its snapshot helpers created before its native thread exits,
+following the runtime's existing GS/TSD cleanup contract. This fixes an existing render-snapshot lifetime gap as
+well as the new wait path; it cannot explain an early crash before any snapshot. A live PE fixture consumes all
+request budgets and checks the guest PEB and normal completion after the diagnostic thread exits.
+
+No game compatibility fix or crash causality is established yet. The same delayed harness command should be
+measured again with these diagnostic repairs before attributing a rendering or startup failure to Windows APIs.
+
+Validation of these repairs passed the native probe, nine protocol/validation tests, four live/core integration
+tests (including diagnostic-thread exit), and a complete `make -C VXRuntime check`. The earlier intermediate
+check encountered the known D3D12 zero timestamp; the final complete pass does not establish that flake is fixed.
