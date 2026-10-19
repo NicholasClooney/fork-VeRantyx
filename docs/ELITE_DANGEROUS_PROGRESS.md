@@ -113,3 +113,31 @@ failure; every original test after that failing command was then run separately 
 passing `make check`. An earlier sandbox run could not access Metal, and the first unsandboxed run missed the CPU
 fixture's 0.2-second startup sample; the unchanged CPU fixture passed in the subsequent full run. ARM64 and game
 harness validation remain pending.
+
+### First wait/caller run
+
+`20261019T165747Z-elite-keyboard-diagnostic` passed result validation. It connected after 36.7 seconds (`o2`, `d3`),
+with no observed unhandled exception or missing-call termination (`o14`, `o16`, `o18`). The final `frame_end.png`
+still shows the SteamVR waiting background; automatic `controls` is not a new milestone or a playability claim.
+
+At 30/40/50 seconds, Present entered/completed/success all increased 1 → 2 → 108 (`o21`). This run therefore does
+not establish the earlier plateau at 87. Its last Present thread token was 5 in all three snapshots (`o22`): last
+completed LeaveCriticalSection at `main_image+0x55b891`, then SleepConditionVariableSRW at `+0x5d6d7f`, then last
+completed EnterCriticalSection at `+0x54c1ee`. These are different calls, not one continuous blocked wait. The
+thread's aggregate covered-call counts were 6732529 → 11972667 → 12856447; these are not per-API frequencies.
+All wait snapshots had `overflow=true`, so missing object tokens or records cannot establish absence of waits.
+
+Read-only static analysis of the observed caller sites identifies a 10 ms shared-mode condition-variable wait in
+a generation-based worker loop. The observed critical-section wrappers maintain their own owner/recursion fields
+at +0x30/+0x38, rather than reading Windows CRITICAL_SECTION owner/recursion fields. Allocator contention or task
+workload remain hypotheses; this analysis does not establish a specific incorrect Windows API behavior. No sync
+or rendering semantics were changed from these observations.
+
+Because Present still grew during the sampled interval, `--diagnostic-delay 60` now shifts the same three bounded
+snapshots to 90/100/110 seconds (recorded in each diagnostic configuration), for a 120-second follow-up. The default
+remains 30/40/50 seconds; this changes observation timing only. OpenVR Submit, authentication, game-scene rendering
+and physical input remain unknown. Longer connection time with broad instrumentation is not a measured performance
+regression against the earlier run.
+
+The delayed-schedule change passed its schedule/bounds test and a complete `make -C VXRuntime check` execution,
+including the D3D12 query test on that execution. The intermittent timestamp issue is not considered fixed.

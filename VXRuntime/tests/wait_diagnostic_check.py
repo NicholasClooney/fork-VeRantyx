@@ -27,6 +27,16 @@ def snapshot():
 
 
 class WaitDiagnostic(unittest.TestCase):
+    def test_delayed_schedule_is_recorded(self):
+        m=h.WindowMetadata(True,True,False,True,delay=60)
+        self.assertEqual(m.schedule,(90,100,110))
+        for config in (m.config,m.render_config,m.wait_config):
+            self.assertEqual(config['schedule_seconds'],[90,100,110])
+            self.assertEqual(config['max_samples'],3)
+        for bad in (-1,3601,float('nan'),float('inf'),True,'60'):
+            with self.assertRaises(ValueError):h.WindowMetadata(False,wait=True,delay=bad)
+        self.assertEqual(h.WindowMetadata(True).schedule,(30,40,50))
+
     def test_opt_in_and_environment_scrub(self):
         env = h.control_environment({'VXRT_WAIT_DIAG': '1', 'VXRT_CONTROL': '/tmp/secret', 'KEEP': 'yes'})
         self.assertEqual(env, {'KEEP': 'yes'})

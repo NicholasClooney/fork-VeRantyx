@@ -573,7 +573,10 @@ def valid_wait_samples(rows):
 class WindowMetadata:
     schedule = (30, 40, 50)
 
-    def __init__(self, enabled, render=False, cpu=False, wait=False):
+    def __init__(self, enabled, render=False, cpu=False, wait=False, delay=0):
+        if type(delay) not in (int, float) or not math.isfinite(delay) or not 0 <= delay <= 3600:
+            raise ValueError("diagnostic delay must be finite and between 0 and 3600 seconds")
+        self.schedule = tuple(t + delay for t in type(self).schedule)
         self.cpu = CpuDiagnostic(cpu)
         if cpu and not enabled:
             raise ValueError("cpu_diagnostic requires window_metadata")
@@ -760,8 +763,8 @@ class WindowMetadata:
                                            for source in WAIT_SOURCES}
 
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
-        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False, cpu_diagnostic=False, wait_diagnostic=False):
-    windows = WindowMetadata(window_metadata, render_diagnostic, cpu_diagnostic, wait_diagnostic)
+        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False, cpu_diagnostic=False, wait_diagnostic=False, diagnostic_delay=0):
+    windows = WindowMetadata(window_metadata, render_diagnostic, cpu_diagnostic, wait_diagnostic, diagnostic_delay)
     if wait_diagnostic and "VXRT_TRACE_CALLS" in os.environ:
         raise ValueError("wait_diagnostic conflicts with VXRT_TRACE_CALLS")
     diagnostic = network_diagnostic_config(network_diagnostic)
@@ -1001,6 +1004,7 @@ def main():
     ap.add_argument("--root"); ap.add_argument("--overlay")
     ap.add_argument("--trace", action="store_true", help="VXRT_TRACE=1 (slower: more in the log)")
     ap.add_argument("--cpu-diagnostic", action="store_true", help="one 2 s CPU PC window; requires --window-metadata; no stacks or thread names")
+    ap.add_argument("--diagnostic-delay", type=float, default=0, help="delay the three diagnostic snapshots by 0..3600 seconds (default 0)")
     ap.add_argument("--wait-diagnostic", action="store_true", help="three bounded wait snapshots in the selected main process; no text payloads")
     ap.add_argument("--render-diagnostic", action="store_true", help="three fixed D3D11/DXGI counter snapshots in the selected main process; no textures or OpenVR hooks")
     ap.add_argument("--window-metadata", action="store_true", help="three read-only window metadata samples; no text or input")
@@ -1036,7 +1040,7 @@ def main():
                 scenario, _, quality = name.partition("@")
                 r = run(key, scenario, quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam,
                         settings=dict(kv.split("=", 1) for kv in a.set), safety_env=dict(kv.split("=", 1) for kv in a.safety_env),
-                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic)
+                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic, diagnostic_delay=a.diagnostic_delay)
                 code = {"pass": 0, "fail": 1, "no_baseline": 2, "refused": 3}.get(r["status"], 4)
                 if code == 3: sys.exit(3)                      # (refused: the rest would be too)
                 worst = max(worst, code)
@@ -1051,7 +1055,7 @@ def main():
     try:
         r = run(a.game, a.scenario, a.quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam, quiet=a.json,
                 settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream,
-                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic)
+                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic, diagnostic_delay=a.diagnostic_delay)
     except Exception as e:                                    # (an error in the harness itself, not a game's)
         print(f"vxrt run: error: {e}", file=sys.stderr); sys.exit(4)
     if a.json:
