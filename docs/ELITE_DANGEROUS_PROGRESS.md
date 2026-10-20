@@ -1,6 +1,6 @@
 # Elite Dangerous support progress
 
-Last updated: 2026-10-19 (UTC).
+Last updated: 2026-10-20 (UTC).
 
 Goal: run the legally installed Windows game on VXRuntime with Apple Vision Pro and keyboard/mouse input.
 Current status: **ED connects to SteamVR, but the captured VR image is still the SteamVR waiting environment.
@@ -73,11 +73,12 @@ The final focused tests, including module mapping and clock-failure cleanup, pas
 full `make check`; the final allowlist version encountered the known D3D12 second-timestamp failure. This remains
 an explicit test exception, not a passing final full suite or a black-screen fix.
 
-## Next work (paused at the user's end-of-day request)
+## Next work (resumed 2026-10-20)
 
 1. Investigate the 11 translated shaders that fail Metal compilation in `20261019T181052Z-elite-keyboard-diagnostic`:
    vector float2/float3 expressions are cast to scalar half, and uint2 to scalar ushort. The next lead is
-   min-precision min16float/min16uint handling in DXBC-to-MSL (`dxbc.c`); no repair has been started or verified.
+   DXBC-to-MSL half-conversion handling (`dxbc.c`). The resumed investigation identifies F32TOF16/F16TOF32
+   templates, rather than establishing a minimum-precision operand-flag problem; see the follow-up below.
 2. Recheck the later Present/main-commit plateau at 1401/2231 after those compilation errors. CPU and window
    callbacks continue; neither a deadlock nor the causal link to those shader failures is established.
 3. Establish transparent real OpenVR Submit evidence if needed. Submit remains unobserved, the final stream is
@@ -86,8 +87,8 @@ an explicit test exception, not a passing final full suite or a black-screen fix
 4. The matched 5de5ab7 versus 222e4d0 ABBA performance comparison was not done. The single B run's near-60 stream
    rate is not an A/B conclusion. Keep stage progress, settings, load and cache/overlay state visible in a later comparison.
 
-No new fixes, subagents, game runs or ABBA are scheduled today. The sections below retain chronological evidence;
-older statements that a follow-up was pending refer to that point in the investigation.
+Work resumed on 2026-10-20 to investigate the shader failures. Harness runs and other-game vr-check remain with
+the coordinator. The sections below retain chronological evidence; older pending/paused statements refer to that time.
 
 ## Wait/caller diagnostic implementation (2026-10-19)
 
@@ -456,3 +457,39 @@ Outstanding verification and limits:
 
 The final cache implementation and its synthetic GPU fixtures are verified as described above. Today's game
 results do not justify an ED draws/runs/playable claim. Work is paused; helpers are closed.
+
+
+## Half-conversion emitter follow-up — 2026-10-20
+
+The failing expressions printed in `20261019T181052Z-elite-keyboard-diagnostic` selected log lines 378–448 match
+exactly the F32TOF16 and F16TOF32 emitter templates: selected source lanes can form float2/float3 or uint2 vectors,
+while half/ushort casts were hardcoded as scalar. This establishes the emitter path from existing log text without
+copying game shader bytecode or assuming minimum-precision operand flags caused it.
+
+The conversion helper now carries the destination's selected component count through halfN, ushortN and the
+uintN/floatN result. It reuses the existing source swizzle/mask handling and single assignment, retaining source/
+destination alias behavior. Encoding still puts one half bit pattern into each 32-bit lane with zero-extension;
+decoding still ignores the upper 16 bits of each lane. Scalar conversion and the existing Metal numeric-conversion
+path are unchanged. This is a width correction for two opcodes, not a new implementation of min16precision flags.
+
+Independent synthetic DXBC tests exercise both directions through Metal compilation, dispatch and GPU readback.
+The old translator reproduces float2/3/4-to-half and uint2/3/4-to-ushort compiler errors. The repaired translator
+passes 3600 output words per direction (7200 total): every nonempty destination mask, vector widths 1–4, swizzles,
+select-one/immediate broadcast, source/destination aliasing, untouched lanes, output upper-bit clearing and input
+upper-bit discard. Inputs include signed zero, exact normal/half-subnormal values, infinities and NaN classification.
+The oracle uses safe math and exactly representable values; it does not establish full rounding or production
+fast-math behavior, nor implement minimum-precision operand flags. No game bytecode is part of the fixture.
+
+Alyx menu/menu@3k/chapter@3k, The Lab title and Earth start cross-game checks are **not checked: not installed**,
+as confirmed by the coordinator in both default and ED-isolated harness environments. No installation/download
+is authorized and missing games are not passes. Existing 21 shader compile checks and the new synthetic GPU
+fixtures provide translator regressions, but do not replace those game checks. A new ED harness result is still
+required; Present plateau, actual OpenVR Submit and ED scene content remain unverified follow-ups.
+
+
+The integrated change passed a complete `make -C VXRuntime check`, including all 21 existing shader compilations
+and the new 7200-word GPU conversion fixture. No D3D12 exception was needed for that final pass. The first full
+attempt stopped at the existing CPU-diagnostic test's first 0.2-second snapshot being unavailable (the later two
+were valid); the original CPU target passed independently, then the entire suite passed unchanged. This transient
+failure is disclosed, not waived or claimed fixed. Profile validation reports five valid profiles and no problems;
+the original 181052Z sealed result validates unchanged. ED and cross-game harness conclusions remain pending.

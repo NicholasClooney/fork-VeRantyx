@@ -453,6 +453,22 @@ static void componentwise(gen *g, const instr *in, int kind, int result_kind, co
     snprintf(expr, sizeof expr, fmt, a, b, c, type_name(result_kind, n), type_name(K_UINT, n));
     assign(g, &in->ops[0], expr, result_kind, n, in->saturate);
 }
+// Half conversions carry one 16-bit encoding in each 32-bit lane, not a packed pair.
+static void half_convert(gen *g, const instr *in) {
+    if (in->ops[0].type == OPD_NULL) return;
+    int comps[4], n = dest_comps(&in->ops[0], comps);
+    int encode = in->op == OP_F32TOF16;
+    int result_kind = encode ? K_UINT : K_FLOAT;
+    static const char *suffix[] = { "", "", "2", "3", "4" };
+    char a[700], expr[900];
+    src(g, &in->ops[1], comps, n, encode ? K_FLOAT : K_UINT, a, sizeof a);
+    // Keep the half value and its bit reinterpretation the same width as the selected source lanes.
+    if (encode) snprintf(expr, sizeof expr, "%s(as_type<ushort%s>(half%s(%s)))",
+                         type_name(result_kind, n), suffix[n], suffix[n], a);
+    else snprintf(expr, sizeof expr, "%s(as_type<half%s>(ushort%s(%s & 0xffffu)))",
+                  type_name(result_kind, n), suffix[n], suffix[n], a);
+    assign(g, &in->ops[0], expr, result_kind, n, in->saturate);
+}
 // Comparisons give all ones or zero per component.
 static void compare(gen *g, const instr *in, int kind, const char *op) {
     char fmt[128];
@@ -1107,8 +1123,7 @@ static void translate(gen *g, const instr *in) {
     case OP_FIRSTBIT_LO: componentwise(g, in, K_UINT, K_UINT, "select(ctz(%1$s), %4$s(0xffffffffu), %1$s == 0u)"); break;
     case OP_FIRSTBIT_HI: componentwise(g, in, K_UINT, K_UINT, "select(%4$s(31u) - clz(%1$s), %4$s(0xffffffffu), %1$s == 0u)"); break;
     case OP_FIRSTBIT_SHI: componentwise(g, in, K_INT, K_UINT, "select(%4$s(31u) - clz(as_type<%4$s>(select(%1$s, ~%1$s, %1$s < 0))), %4$s(0xffffffffu), %1$s == 0 || %1$s == -1)"); break;
-    case OP_F32TOF16: componentwise(g, in, K_FLOAT, K_UINT, "%4$s(as_type<ushort>(half(%1$s)))"); break;
-    case OP_F16TOF32: componentwise(g, in, K_UINT, K_FLOAT, "float(as_type<half>(ushort(%1$s & 0xffffu)))"); break;
+    case OP_F32TOF16: case OP_F16TOF32: half_convert(g, in); break;
     case OP_UBFE: case OP_IBFE: case OP_BFI: bitfield(g, in); break;
     case OP_MOVC: {
         int comps[4], n = dest_comps(&in->ops[0], comps);

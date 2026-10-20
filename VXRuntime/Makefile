@@ -368,6 +368,7 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	$(MAKE) dxbc-failure-diag-check
 	$(MAKE) high-srv-check
 	$(MAKE) uav-texture-clear-check
+	$(MAKE) half-conversion-check
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
@@ -576,3 +577,11 @@ build/uav_texture_clear.exe: tests/uav_texture_clear.c
 
 uav-texture-clear-check: build/uav_texture_clear.exe $(VXRT)
 	MTL_DEBUG_LAYER=1 VXRT_NO_WINE=1 VXRT_NO_ACTIVATE=1 VXRT_ROOT=build/uav-texture-clear-root $(VXRT) build/uav_texture_clear.exe
+
+.PHONY: half-conversion-check
+build/half_conversion: tests/half_conversion.m src/dxbc.c src/dxbc.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -Isrc -o $@ tests/half_conversion.m src/dxbc.c -framework Metal -framework Foundation
+
+half-conversion-check: build/half_conversion
+	MTL_DEBUG_LAYER=1 build/half_conversion
