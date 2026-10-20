@@ -582,3 +582,55 @@ passes without the timestamp waiver on this attempt. The original 101805Z result
 schema check reports five valid profiles. GPU/allocation/write/fsync/close failures were not fault-injected;
 their categories are code paths, not measured game findings. No game capture fix or successful new capture is
 claimed before the next harness run. Other-game VR checks remain not checked: not installed.
+
+### 2026-10-20 wrap-up: user-confirmed login-error UI
+
+`20261020T103117Z-elite-keyboard-diagnostic` captured the selected ED main process's own back buffer:
+`o24` reports captured, `o25` seals an1800x1169 PNG, and `o27` records claimed/readback/encode/write/done with
+final category `ok`. **The user, not an agent, viewed the PNG** and reported the expected login-failure screen.
+Agents did not open, describe from inspection, OCR or analyze the PNG. It stays under ignored `runs/`, uncommitted.
+
+This user report confirms ED renders its own UI. Per the user, ED must be started through the Frontier launcher
+rather than directly through the game executable; the direct launch explains the login error, and ED remaining
+at that error explains the SteamVR waiting background. This explanation is attributed to the user, not to an
+independent authentication or Submit diagnosis. At the user's request, the read-only login investigation was
+stopped, both helpers were closed, and no investigation edits remained. The user is satisfied that ED launches
+and renders. No launcher path was attempted. The next step, only if requested later, is to start ED through its
+launcher; it is not an instruction to continue now.
+
+Today's implemented and measured changes:
+
+- `25cb233` corrects F32TOF16/F16TOF32 conversion widths. `20261020T094016Z` records zero shader compile failures
+  versus11 in181052Z, with `o21` completed Presents3014/3612/4209 at110/120/130s instead of the earlier plateau.
+- `0d2b703` and `9369e80` add the bounded exact-PID one-shot Present snapshot and fixed-stage trace. In101805Z
+  the request armed but produced no PNG (`o24`); that cause remains unknown. The successful103117Z capture does
+  not prove why the previous attempt failed. In103117Z, `o21` advances6207/6785/7386 at150/160/170s, and `o22`
+  samples different Present/condition-wait calls on thread5, not one established continuous stall.
+
+ED is still **not established as `draws` by the VR harness**: its compositor output remains the waiting background,
+and user-confirmed desktop UI rendering is distinct from eye-frame delivery. OpenVR Submit remains
+`not_instrumented`; authentication success, launcher handoff, headset input and playability remain unverified.
+Alyx/TheLab/Earth VR regression checks are **not checked: not installed**. No game files, tickets, credentials,
+ownership checks or authentication responses were modified. This wrap-up changes documentation/profile only.
+
+Outstanding limitations and unverified behavior at this handoff:
+
+- Direct game-executable startup produces the login-failure UI reported by the user; the user says Frontier
+  launcher startup is required. That player startup flow has not been attempted on VXRuntime.
+- OpenVR Submit has not been observed/instrumented. ED eye frames and the VR harness `draws` milestone are not
+  established. Authentication success, physical keyboard/mouse, headset/controllers and AVP playback are unverified.
+- Alyx, TheLab and Earth baseline VR checks cannot run here: not checked because those games are not installed.
+- Texture1D allocation still forces one mip; multi-mip behavior and the associated Map bounds defect are unresolved.
+  Texture2D/3D clear tests do not cover or fix that limitation.
+- Existing ClearState resets render targets only rather than all stage bindings; the high-SRV work did not fix it.
+- Signed R32Sint atomic texture descriptor/view creation was tested, but signed atomic GPU execution was not.
+- Harness `o1`/`d4` monitor the launcher script, not the ED process lifetime; they can miss a game exit while the
+  launcher is cleaning up. They do not prove ED completed the whole scenario.
+- The intermittent D3D12 second timestamp being zero is a known user-waived check failure, not fixed. The latest
+  full checks passed without needing that waiver.
+- CPU diagnostic's first0.2s sample was transiently unavailable during the half-conversion checks; independent
+  and full unchanged retries passed. This was not fixed or granted a new waiver.
+- The101805Z armed/no_png outcome remains unexplained; repository-path synthetic capture and103117Z capture
+  succeeded, but do not establish that earlier run's cause.
+- No alternating ABBA comparison of5de5ab7 versus222e4d0 was performed. Recovered stream rates in a single cached
+  clear run do not establish a cache performance benefit; snapshot readback further prevents a fair comparison.
