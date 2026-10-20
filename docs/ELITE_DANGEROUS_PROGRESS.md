@@ -493,3 +493,34 @@ attempt stopped at the existing CPU-diagnostic test's first 0.2-second snapshot 
 were valid); the original CPU target passed independently, then the entire suite passed unchanged. This transient
 failure is disclosed, not waived or claimed fixed. Profile validation reports five valid profiles and no problems;
 the original 181052Z sealed result validates unchanged. ED and cross-game harness conclusions remain pending.
+
+
+### Shader follow-up run and OpenVR evidence boundary
+
+`20261020T094016Z-elite-keyboard-diagnostic` after 25cb233 records no `did not compile` lines, compared with 11 in
+181052Z. It connects after 17.4 seconds (`o2`, `d3`), records `o14=0`, `o18=null`, `o23=null`, and has completed
+Presents 3014/3612/4209 at 110/120/130 seconds (`o21`), with main commits 17504/20395/23285. The previous plateau
+is not reproduced in this run. Capture/stream rates 60.0/59.7 (`o4`, `o6`) and GPU utilization 35 (`o10`) do not
+identify ED eye frames. The captured output remains the waiting background (`o12=10.7`, `o13=0.226`). Continuous
+DXGI presentation alone does not establish the game window's image content or that nothing was submitted to VR.
+
+The selected game PID43407 identifies itself as VRApplication_Scene in its log lines124/126 and opens the
+compositor pipe at lines224–228. Sealed vrserver lines223–234 identify the same PID/application and an existing
+HMD; HMD bindings are loaded later. The currently existing overlay vrcompositor log, not sealed as a run
+observation, also records the external connection for PID43407 at local10:40:36.711. It has no per-eye Submit,
+texture-receive, returned-error or resource-import record for ED. Historical previous logs were excluded. This
+supports initialization/connection, not whether IVRCompositor::Submit was called or accepted.
+
+Submit is a real PE-to-PE virtual call and bypasses the runtime's builtin-export tracing. OpenVR/vrclient are
+loaded from real DLLs rather than a builtin implementation; their exact final mapped file identities were not
+recorded with loader trace in this run. The driver's virtual-display Present consumes compositor output, not the
+game's eye Submit. A log in runtime shared-resource create/open/copy paths could supply indirect resource-flow
+evidence but would not by itself reveal eye, OpenVR texture type or Submit result. No Valve vtable/proxy patch is
+an acceptable substitute for transparent evidence.
+
+`o20` contains only one visible/enabled/nonminimized window for PID43407 at each sample, no text or contents.
+Arguments remain empty; the harness VR precondition merely rejects known VR-disabling arguments, so it is not
+proof of the game's selected mode. There is no evidence yet to add `-vr` or modify game configuration. Window
+text/Command Clips content/OCR was not read or newly collected; the coordinator requires approval before adding
+text reading. A bounded window-content observation is a possible next discriminating step, subject to that approval.
+OpenVR Submit, game UI state, authentication and actual scene rendering remain unknown.
