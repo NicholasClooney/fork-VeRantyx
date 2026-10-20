@@ -634,3 +634,36 @@ Outstanding limitations and unverified behavior at this handoff:
   succeeded, but do not establish that earlier run's cause.
 - No alternating ABBA comparison of5de5ab7 versus222e4d0 was performed. Recovered stream rates in a single cached
   clear run do not establish a cache performance benefit; snapshot readback further prevents a fair comparison.
+
+### Launcher preflight: missing CLR support (hard stop)
+
+For the requested player-style startup, the coordinator imported the launcher-containing install into a separate
+repository-owned `build/ed-launcher-isolated` root. The older ED-only root was not changed. This preflight read
+only PE startup metadata, the `supportedRuntime` configuration entry and runtime source/component filenames;
+it did not read imported private `logs/` or `Cache`, the source install, or any PNG.
+
+Static evidence from `build/ed-launcher-isolated/steam/steamapps/common/Elite Dangerous/EDLaunch.exe`:
+
+- PE machine0x14c and optional-header magic0x10b identify a PE32 image. CLR directory RVA0x2008 has size72;
+  CLR flags0x1 indicate IL-only code. Its only native import is `mscoree.dll!_CorExeMain`.
+- `EDLaunch.exe.config:10` declares `supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.8"`.
+- `VXRuntime/src/loader.c:446-447` accepts only machine0x8664 and optional-header magic0x20b (PE32+ x86-64),
+  otherwise returning ERROR_BAD_EXE_FORMAT. The source contains no `_CorExeMain`/mscoree CLR host implementation.
+- No `clr.dll`, `mscoree.dll`, `coreclr.dll`, `mscorlib.dll`, `PresentationFramework.dll` or `hostfxr.dll` was found
+  among the new isolated root's component filenames. The launcher is not supplied with the required CLR/WPF host.
+
+These are static startup blockers, not a measured launcher crash or a finding about Frontier authentication.
+An IL-only PE32 image does not by itself require a32-bit CLR: a proper managed hosting path must interpret its
+metadata. Changing the executable's PE header, adding a successful `_CorExeMain` stub or bypassing the launcher
+would not implement the missing behavior and was not attempted.
+
+The user's explicit stop condition applies: missing .NET Framework/runtime hosting would require a separately
+approved runtime acquisition/installation and compatibility investigation, or a substantial CLR project. No
+launcher run, network request, download, sign-in interaction or CLR implementation was attempted. No run command
+is offered. The needed decision is whether to authorize that separate work; this task stops here.
+
+A runnable launcher scenario was deliberately not added at this gate. Current scenario schema has no executable
+override (`games/profile.schema.json:17-28`); executable selection is profile-wide. Adding an ignored `exe` field
+or a scenario that still starts EliteDangerous64.exe would misrepresent launcher coverage. Such harness support,
+Steam launch-option verification and launcher UI observation remain future work only after the runtime gate is
+resolved. The existing direct-executable diagnostic profile and all prior evidence remain intact.
