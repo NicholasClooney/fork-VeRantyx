@@ -171,6 +171,7 @@ static dev_t g_meta_dev;
 static ino_t g_meta_ino;
 static int g_cpu_mode;
 static int g_wait_mode;
+static int g_snapshot_mode;
 static int g_meta_mode; // 1 windows, 2 render, 3 both
 static char *diagnostic_snapshot(void) {
     vx_cpudiag_start();
@@ -218,12 +219,20 @@ static int metadata_ready(int fd, short events, double deadline) {
 }
 static void *metadata_serve(void *arg) {
     int ls = (int)(intptr_t)arg;
+    if (g_snapshot_mode) vx_present_snapshot_enable();
     unsigned metadata_count = 0, cpu_count = 0, wait_count = 0;
-    for (unsigned attempt = 0; attempt < (3u + (g_cpu_mode ? 1u : 0u) + (g_wait_mode ? 3u : 0u)); ++attempt) {
+    unsigned attempts = 0, snapshot_count = 0;
+    unsigned metadata_limit = g_snapshot_mode ? 4u : 3u;
+    unsigned limit = metadata_limit + (g_cpu_mode ? 1u : 0u) + (g_wait_mode ? 3u : 0u);
+    while (attempts < limit || (g_snapshot_mode && snapshot_count < 8)) {
         int fd;
         do { fd = accept(ls, NULL, NULL); } while (fd < 0 && errno == EINTR);
         if (fd < 0) break;
-        if (fcntl(fd, F_SETFD, FD_CLOEXEC) || fcntl(fd, F_SETFL, O_NONBLOCK)) { close(fd); continue; }
+        if (fcntl(fd, F_SETFD, FD_CLOEXEC) || fcntl(fd, F_SETFL, O_NONBLOCK)) {
+            close(fd);
+            if (attempts++ >= limit && g_snapshot_mode) ++snapshot_count;
+            continue;
+        }
         int yes = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof yes);
         double deadline = now_ms() + 2000;
         char command[64]; size_t n = 0; int complete = 0;
@@ -234,9 +243,31 @@ static void *metadata_serve(void *arg) {
             if (command[n++] == '\n') { complete = 1; break; }
         }
         command[n] = 0;
-        char *state = complete && !strcmp(command, "metadata\n") && metadata_count++ < 3 ? diagnostic_snapshot() :
-                      complete && g_cpu_mode && !strcmp(command, "cpu\n") && cpu_count++ < 1 ? cpu_snapshot() :
-                      complete && g_wait_mode && !strcmp(command, "wait_snapshot\n") && wait_count++ < 3 ? wait_snapshot() : NULL;
+        char *state = NULL;
+        if (complete && !strncmp(command, "present_snapshot ", 17)) {
+            if (snapshot_count++ < 8) {
+                const char *p = command + 17;
+                uint64_t pid = 0; int valid = *p >= '0' && *p <= '9';
+                while (*p >= '0' && *p <= '9') {
+                    unsigned digit = (unsigned)(*p++ - '0');
+                    if (pid > (UINT64_MAX - digit) / 10) valid = 0;
+                    else pid = pid * 10 + digit;
+                }
+                if (valid && !strcmp(p, "\n")) {
+                    const char *status = g_snapshot_mode ? vx_present_snapshot_arm(pid) : "disabled";
+                    state = malloc(128);
+                    if (state) snprintf(state, 128, "{\"schema_version\":1,\"status\":\"%s\",\"pid\":%d}", status, (int)getpid());
+                }
+            }
+            if (!g_snapshot_mode || snapshot_count > 8) ++attempts;
+        } else {
+            // Other commands cannot consume the capture command's independent budget.
+            if (attempts++ < limit) {
+                state = complete && !strcmp(command, "metadata\n") && metadata_count++ < metadata_limit ? diagnostic_snapshot() :
+                        complete && g_cpu_mode && !strcmp(command, "cpu\n") && cpu_count++ < 1 ? cpu_snapshot() :
+                        complete && g_wait_mode && !strcmp(command, "wait_snapshot\n") && wait_count++ < 3 ? wait_snapshot() : NULL;
+            } else if (g_snapshot_mode) ++snapshot_count;
+        }
         const char *response = state ? state : "{\"status\":\"rejected\"}";
         char wire[131072]; int len = snprintf(wire, sizeof wire, "%s\n", response);
         free(state);
@@ -255,7 +286,7 @@ static void *metadata_serve(void *arg) {
     vx_thread_detach();
     return NULL;
 }
-void vx_control_metadata_start(const char *exe) {
+static void metadata_start(const char *exe) {
     const char *mode = getenv("VXRT_CONTROL_DIAG"), *target = getenv("VXRT_CONTROL_TARGET");
     const char *path = getenv("VXRT_CONTROL_DIAG_SOCKET");
     if (!mode || !target || !path || getenv("VXRT_CHILD")) return;
@@ -293,9 +324,17 @@ void vx_control_metadata_start(const char *exe) {
     if (selected & 2) vx_renderdiag_enable();
     g_wait_mode = getenv("VXRT_WAIT_DIAG") && !strcmp(getenv("VXRT_WAIT_DIAG"), "1");
     if (g_wait_mode) vx_waitdiag_enable();
+    g_snapshot_mode = getenv("VXRT_PRESENT_SNAPSHOT_CONTROL") && !strcmp(getenv("VXRT_PRESENT_SNAPSHOT_CONTROL"), "1");
     pthread_t thread;
     if (pthread_create(&thread, NULL, metadata_serve, (void *)(intptr_t)ls)) {
         close(ls); metadata_cleanup(); return;
     }
     pthread_detach(thread);
+}
+
+void vx_control_metadata_start(const char *exe) {
+    // Native startup must not create a guest TEB just to preserve last-error.
+    int saved_errno = errno;
+    metadata_start(exe);
+    errno = saved_errno;
 }

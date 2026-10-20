@@ -8,6 +8,8 @@
 #import <ImageIO/ImageIO.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
 #include "d3d_common.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -357,33 +359,91 @@ static WINAPI HRESULT swapchain_get_buffer(void *this, uint32_t index, const GUI
     return call_qi(sc->buffer, iid, out);
 }
 // A texture's first level as a PNG (8-bit RGBA/BGRA textures), for VXRT_PRESENT_SNAPSHOT and VXRT_SHARED_SNAPSHOT.
-void d3d_texture_png(d3d_device *dev, void *texture, const char *path) {
+// Walk every directory through an fd: neither parents nor the final name may be symlinks.
+static int snapshot_write(const char *path, CFDataRef data) {
+    if (!path || path[0] != '/') return 0;
+    char *copy = strdup(path + 1);
+    if (!copy) return 0;
+    int dir = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC), fd = -1, ok = 0;
+    char *name = copy, *slash;
+    while (dir >= 0 && (slash = strchr(name, '/'))) {
+        *slash = 0;
+        if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) goto done;
+        int next = openat(dir, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        close(dir); dir = next; name = slash + 1;
+    }
+    if (dir < 0 || !*name || !strcmp(name, ".") || !strcmp(name, "..")) goto done;
+    fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) goto done;
+    CFIndex size = CFDataGetLength(data), offset = 0;
+    while (offset < size) {
+        ssize_t n = write(fd, CFDataGetBytePtr(data) + offset, (size_t)(size - offset));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        offset += n;
+    }
+    ok = offset == size && fsync(fd) == 0;
+    if (close(fd)) ok = 0;
+    fd = -1;
+    if (!ok) unlinkat(dir, name, 0);
+done:
+    if (fd >= 0) close(fd);
+    if (dir >= 0) close(dir);
+    free(copy);
+    return ok;
+}
+static int texture_png(d3d_device *dev, void *texture, const char *path, int exclusive) {
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     MTLPixelFormat f = tex.pixelFormat;
     int bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
-    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) { vx_log("snapshot: format %d is not 8-bit", (int)f); return; }
+    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) return 0;
     NSUInteger w = tex.width, h = tex.height, row = w * 4;
+    if (!w || !h || w > SIZE_MAX / 4 || h > SIZE_MAX / row) return 0;
     id<MTLBuffer> buf = [tex.device newBufferWithLength:row * h options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    if (!buf || !cmd || !blit) { [blit endEncoding]; return 0; }
     [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
                  toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
     [blit endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
-    const uint8_t *mid = (const uint8_t *)buf.contents + (h / 2) * row + (w / 2) * 4;
-    vx_log("snapshot: centre texel bytes %02x %02x %02x %02x", mid[0], mid[1], mid[2], mid[3]);
+    if (cmd.status != MTLCommandBufferStatusCompleted || !buf.contents) return 0;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGBitmapInfo info = bgra ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : (kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast);
-    CGContextRef ctx = CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, info);
+    CGContextRef ctx = cs ? CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, info) : NULL;
     CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
-    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-    CGImageDestinationRef dst = img ? CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL) : NULL;
-    if (dst) { CGImageDestinationAddImage(dst, img, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); }
+    CFMutableDataRef data = CFDataCreateMutable(NULL, 0);
+    CGImageDestinationRef dst = img && data ? CGImageDestinationCreateWithData(data, CFSTR("public.png"), 1, NULL) : NULL;
+    int ok = 0;
+    if (dst) {
+        CGImageDestinationAddImage(dst, img, NULL);
+        if (CGImageDestinationFinalize(dst)) {
+            if (exclusive) ok = snapshot_write(path, data);
+            else ok = [(__bridge NSData *)data writeToFile:[NSString stringWithUTF8String:path] atomically:YES];
+        }
+        CFRelease(dst);
+    }
+    if (data) CFRelease(data);
     if (img) CGImageRelease(img);
     if (ctx) CGContextRelease(ctx);
-    CGColorSpaceRelease(cs);
-    vx_log("snapshot (%lux%lu, format %d) written to %s", (unsigned long)w, (unsigned long)h, (int)f, path);
+    if (cs) CGColorSpaceRelease(cs);
+    return ok;
+}
+void d3d_texture_png(d3d_device *dev, void *texture, const char *path) {
+    if (texture_png(dev, texture, path, 0)) vx_log("snapshot: PNG written to %s", path);
+}
+static int g_snapshot_state; // 0 disabled, 1 available, 2 armed, 3 claimed (including failed captures)
+void vx_present_snapshot_enable(void) {
+    int expected = 0;
+    __atomic_compare_exchange_n(&g_snapshot_state, &expected, 1, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+const char *vx_present_snapshot_arm(uint64_t pid) {
+    if (!__atomic_load_n(&g_snapshot_state, __ATOMIC_ACQUIRE)) return "disabled";
+    if (pid != (uint64_t)getpid()) return "wrong_pid";
+    int expected = 1;
+    return __atomic_compare_exchange_n(&g_snapshot_state, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+        ? "armed" : "already_requested";
 }
 // VXRT_PRESENT_SNAPSHOT=file.png (with VXRT_PRESENT_SNAPSHOT_AT=n, default 300): the back buffer of the n-th
 // present is written to that file, to check what a program draws.
@@ -391,15 +451,29 @@ static id<MTLTexture> resolve_back_buffer(swapchain *sc, id<MTLCommandBuffer> cm
 static void snapshot(swapchain *sc) {
     const char *path = getenv("VXRT_PRESENT_SNAPSHOT");
     const char *at = getenv("VXRT_PRESENT_SNAPSHOT_AT");
-    if (!path || sc->presents + 1 != (uint64_t)(at ? atoll(at) : 300)) return;
+    const char *control = getenv("VXRT_PRESENT_SNAPSHOT_CONTROL");
+    int bounded = control && !strcmp(control, "1");
+    if (bounded) {
+        int expected = 2;
+        if (!__atomic_compare_exchange_n(&g_snapshot_state, &expected, 3, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+        if (!path || getenv("VXRT_CHILD")) return;
+    } else if (!path || sc->presents + 1 != (uint64_t)(at ? atoll(at) : 300)) return;
+    int saved_errno = errno;
+    DWORD saved_error = vx_get_last_error();
     id<MTLTexture> back = (__bridge id<MTLTexture>)sc->buffer->mtl;
     if (back.sampleCount > 1) {                     // multisampled: the resolved picture
         id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
         back = resolve_back_buffer(sc, cmd, back);
         [cmd commit];
         [cmd waitUntilCompleted];
+        if (bounded && (!back || cmd.status != MTLCommandBufferStatusCompleted)) {
+            vx_set_last_error(saved_error); errno = saved_errno; return;
+        }
     }
-    d3d_texture_png(sc->dev, (__bridge void *)back, path);
+    if (bounded) texture_png(sc->dev, (__bridge void *)back, path, 1);
+    else d3d_texture_png(sc->dev, (__bridge void *)back, path);
+    vx_set_last_error(saved_error);
+    errno = saved_errno;
 }
 // A multisampled back buffer (as the program asked for) is shown through a plain texture it is resolved into.
 static id<MTLTexture> resolve_back_buffer(swapchain *sc, id<MTLCommandBuffer> cmd, id<MTLTexture> back) {

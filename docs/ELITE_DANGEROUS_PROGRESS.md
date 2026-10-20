@@ -524,3 +524,32 @@ proof of the game's selected mode. There is no evidence yet to add `-vr` or modi
 text/Command Clips content/OCR was not read or newly collected; the coordinator requires approval before adding
 text reading. A bounded window-content observation is a possible next discriminating step, subject to that approval.
 OpenVR Submit, game UI state, authentication and actual scene rendering remain unknown.
+
+### User-first, bounded window snapshot
+
+The user authorized one late DXGI back-buffer PNG to distinguish window content from the waiting stream.
+`--present-snapshot-at 150` in a 180-second run opts in; default behavior captures nothing. At that elapsed time,
+the private metadata socket supplies the selected main process PID, then receives one PID-matched arm request.
+Only that selected non-child process can claim the request, once across swapchains; TEST Presents do not consume
+it. A failed attempt is not retried. One readback can wait for GPU completion, so this run is not a performance
+comparison. The existing Present-count environment capture is suppressed in controlled mode, including helpers.
+
+The PNG is written exclusively to `runs/<run_id>/present_snapshot.png`, with parent/final symlinks rejected and
+no overwrite. `runs/` is ignored by git. The harness seals only fixed PNG-header metadata, byte size and SHA-256;
+it does not decode pixels, read text chunks, compute brightness or apply stream-frame metrics to this artifact.
+The user must inspect it first: no agent may open, describe, OCR or analyze its pixels. No window text/Command
+Clips content is added. Missing output is `no_png`, not evidence that Present was absent: unsupported formats,
+encoding or write failure can also prevent an artifact. This change does not establish ED rendering or Submit.
+
+The raw overlay `vrcompositor.txt` is also copied and sealed at the end of the run. It may include historical
+sessions and has no automatic Submit-derived claim. Shared-texture tracing and a direct Submit observation remain
+unimplemented. Synthetic runtime fixtures cover PID selection, child/target exclusion, no-arm/no-Present cases,
+TEST handling, no retry across swapchains, path conflicts/symlinks and last-error preservation. Synthetic harness
+fixtures cover one-shot scheduling, snapshot-only transport, status validation and header/hash sealing without
+real game pixels. No real ED back-buffer snapshot has been collected by this implementation yet.
+
+Validation of this instrumentation: `make -C VXRuntime check` passed in full, including 18 snapshot harness
+checks and all 10 synthetic runtime cases; no D3D12 timestamp exception was needed on this attempt. Profile
+schema validation passed (five profiles, zero problems). Cross-game VR checks remain not checked: those games
+are not installed. The next authorized run adds `--present-snapshot-at 150` to the existing 180-second diagnostic
+command; only the user inspects its new PNG. Snapshot overhead is not an ABBA performance measurement.

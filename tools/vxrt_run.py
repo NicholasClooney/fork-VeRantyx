@@ -18,7 +18,7 @@ Exit status: 0 pass, 1 fail, 2 no baseline to compare with, 3 refused, 4 error.
 """
 from vxrt_cpu_sample import CpuDiagnostic
 import socket, stat, tempfile
-import argparse, json, math, mmap, os, re, shutil, signal, statistics, struct, subprocess, sys, threading, time, zlib
+import argparse, hashlib, json, math, mmap, os, re, shutil, signal, statistics, struct, subprocess, sys, threading, time, zlib
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -407,6 +407,8 @@ def validate(result):
             if not refs or any(r not in obs for r in refs):
                 problems.append(f"{kind} {item.get('id')} ({item.get('claim')}) rests on no recorded observation: {refs}")
     for o in obs.values():
+        if o.get("metric") == "present_snapshot_png":
+            continue
         if o.get("artifact") and o.get("sha256"):
             p = os.path.join(REPO, o["artifact"])
             if not os.path.exists(p) or ledger.sha256_file(p) != o["sha256"]:
@@ -435,6 +437,7 @@ def validate(result):
                 problems.append("wait_diagnostic_samples: missing source hashes")
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             problems.append("wait_diagnostic_samples: missing or invalid artifact")
+    problems.extend(validate_present_snapshot(result))
     # Recorded values against what they come from: a median against its samples, the samples against the file.
     for o in obs.values():
         if o["metric"] == "fps_median" and o.get("samples") is not None:
@@ -468,7 +471,7 @@ def git_state():
 
 # Restricted diagnostics use a new protocol, never the text/action Clip client.
 def control_environment(env):
-    return {k: v for k, v in env.items() if not k.startswith("VXRT_CONTROL") and k not in ("VXRT_CPU_DIAG", "VXRT_WAIT_DIAG")}
+    return {k: v for k, v in env.items() if not k.startswith(("VXRT_CONTROL", "VXRT_PRESENT_SNAPSHOT")) and k not in ("VXRT_CPU_DIAG", "VXRT_WAIT_DIAG")}
 
 RENDER_APIS = ("D3D11CreateDevice", "D3D11CreateDeviceAndSwapChain", "IDXGIFactory.CreateSwapChain",
                "IDXGIFactory2.CreateSwapChainForHwnd", "IDXGISwapChain.Present", "IDXGISwapChain1.Present1")
@@ -589,6 +592,220 @@ def valid_wait_samples(rows):
             return False
     return True
 
+PRESENT_SOURCES = ("tools/vxrt_run.py", "VXRuntime/src/control.c", "VXRuntime/src/dxgi.m")
+PRESENT_MAX_BYTES = 256 * 1024 * 1024
+PRESENT_NOTE = "Window Present snapshot for the user to inspect first; agents must not view, describe, OCR or analyze pixels. Not stream-frame or Submit evidence. A missing PNG does not establish that no Present occurred; unsupported formats, encoding or file-write failures can also leave no PNG."
+PRESENT_FAILURES = ("not_started", "early_exit", "stopped", "no_pid", "identity_mismatch", "unavailable", "timeout",
+                    "invalid_response", "wrong_pid", "already_requested", "disabled", "no_png", "invalid_png")
+
+
+def present_png_metadata(run_dir):
+    """Read only the fixed PNG header and opaque bytes for hashing; never decode pixels or text chunks."""
+    run_dir = os.path.abspath(run_dir)
+    if os.path.realpath(run_dir) != run_dir:
+        raise ValueError("snapshot run directory is not canonical")
+    directory = os.lstat(run_dir)
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid():
+        raise ValueError("snapshot run directory is not owned")
+    path = os.path.join(run_dir, "present_snapshot.png")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        before = os.fstat(source.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1
+            or not 45 <= before.st_size <= PRESENT_MAX_BYTES):
+            raise ValueError("invalid snapshot file")
+        header = source.read(33)
+        if (len(header) != 33 or header[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+            or zlib.crc32(header[12:29]) != struct.unpack(">I", header[29:33])[0]):
+            raise ValueError("invalid PNG IHDR")
+        width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", header[16:29])
+        depths = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+        if (not 1 <= width <= 16384 or not 1 <= height <= 16384 or depth not in depths.get(color, ())
+            or compression or filtering or interlace not in (0, 1)):
+            raise ValueError("invalid PNG dimensions or format")
+        digest = hashlib.sha256(header)
+        remaining = before.st_size - len(header)
+        while remaining:
+            chunk = source.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("snapshot changed while hashing")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(source.fileno())
+        current = os.lstat(path)
+        identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise ValueError("snapshot changed while hashing")
+    return {"width": width, "height": height, "bit_depth": depth, "color_type": color,
+            "interlace": interlace, "format": "PNG", "size_bytes": before.st_size, "sha256": digest.hexdigest()}
+
+
+class PresentSnapshot:
+    def __init__(self, at, seconds):
+        if at is not None and (type(at) not in (int, float) or not math.isfinite(at) or not 30 <= at <= 3600
+                               or type(seconds) not in (int, float) or not math.isfinite(seconds) or at >= seconds):
+            raise ValueError("present_snapshot_at must be 30..3600 seconds and earlier than run duration")
+        self.enabled = at is not None
+        self.config = {"enabled": self.enabled, "at_seconds": at, "max_requests": 1 if self.enabled else 0,
+                       "request_count": 0, "handshake_count": 0, "pid": None,
+                       "target_selector": "exact_realpath_main_process", "child_excluded": True,
+                       "pixel_analysis": False, "user_inspection_first": True,
+                       "status": "not_started" if self.enabled else "off"}
+
+    def prepare(self, env, run_dir):
+        for key in list(env):
+            if key.startswith("VXRT_PRESENT_SNAPSHOT"):
+                del env[key]
+        if not self.enabled:
+            return
+        path = os.path.join(os.path.abspath(run_dir), "present_snapshot.png")
+        if os.path.realpath(run_dir) != os.path.abspath(run_dir) or os.path.lexists(path):
+            raise ValueError("snapshot requires a canonical run directory and a new file")
+        env.update(VXRT_PRESENT_SNAPSHOT_CONTROL="1", VXRT_PRESENT_SNAPSHOT=path)
+        self.config["environment"] = {key: env[key] for key in ("VXRT_PRESENT_SNAPSHOT_CONTROL", "VXRT_PRESENT_SNAPSHOT")}
+
+    def arm(self, windows, elapsed):
+        if not self.enabled or self.config["handshake_count"]:
+            return
+        self.config.update(handshake_count=1, elapsed_seconds=elapsed)
+        handshake = windows.sample()
+        if handshake.get("status") != "ok":
+            self.config["status"] = "no_pid"
+            return
+        pid = handshake.get("pid")
+        if type(pid) is not int or pid <= 0:
+            self.config["status"] = "no_pid"
+            return
+        self.config.update(pid=pid, request_count=1)
+        response = windows.sample(snapshot_pid=pid)
+        self.config["status"] = response["status"]
+        self.config["arm_response"] = response
+
+    def seal(self, run_dir, evidence, early_exit):
+        if not self.enabled:
+            return
+        status = self.config["status"]
+        if status == "not_started":
+            self.config["status"] = "early_exit" if early_exit else "stopped"
+        elif status == "armed":
+            try:
+                metadata = present_png_metadata(run_dir)
+            except FileNotFoundError:
+                self.config["status"] = "early_exit" if early_exit else "no_png"
+            except (OSError, ValueError):
+                self.config["status"] = "invalid_png"
+            else:
+                self.config.update(status="captured", png=metadata, artifact=rel(os.path.join(run_dir, "present_snapshot.png")))
+        self.config["source_hashes"] = {source: ledger.sha256_file(os.path.join(REPO, source)) for source in PRESENT_SOURCES}
+        path = os.path.join(run_dir, "present_snapshot.json")
+        with open(path, "x") as output:
+            json.dump(self.config, output, sort_keys=True, indent=2)
+        evidence.observe("present_snapshot", dict(self.config), path, note=PRESENT_NOTE)
+        if self.config["status"] == "captured":
+            evidence.observe("present_snapshot_png", dict(self.config["png"]),
+                             artifact=None, note=PRESENT_NOTE)
+            evidence.observed[-1].update(artifact=self.config["artifact"], sha256=self.config["png"]["sha256"])
+
+
+def validate_present_snapshot(result):
+    config = result.get("present_snapshot")
+    observations = [o for o in result.get("observed", []) if o.get("metric") in ("present_snapshot", "present_snapshot_png")]
+    if config is None:
+        return ["present_snapshot: missing configuration"] if observations else []
+    problems = []
+    try:
+        enabled = config["enabled"]
+        if type(enabled) is not bool:
+            raise ValueError()
+        expected = PresentSnapshot(config["at_seconds"], result["seconds"]).config
+        for key in ("enabled", "at_seconds", "max_requests", "target_selector", "child_excluded", "pixel_analysis", "user_inspection_first"):
+            if config.get(key) != expected[key]:
+                raise ValueError()
+        status = config["status"]
+        requests, handshakes, pid = config["request_count"], config["handshake_count"], config["pid"]
+        if type(requests) is not int or type(handshakes) is not int or not 0 <= requests <= handshakes <= int(enabled):
+            raise ValueError()
+        if requests and (type(pid) is not int or pid <= 0):
+            raise ValueError()
+        if not requests and pid is not None:
+            raise ValueError()
+        if not enabled:
+            if observations or status != "off" or requests or handshakes or "environment" in config:
+                raise ValueError()
+            return []
+        if result.get("status") == "refused":
+            if observations or status != "not_started" or requests or handshakes:
+                raise ValueError()
+            return []
+        if status not in PRESENT_FAILURES + ("captured",) or status == "not_started":
+            raise ValueError()
+        early = next((o.get("value") for o in result.get("observed", []) if o.get("metric") == "exited_early"), None)
+        if status == "early_exit" and early is not True:
+            raise ValueError()
+        if status == "stopped" and (early is not False or handshakes):
+            raise ValueError()
+        if status in ("identity_mismatch", "unavailable", "timeout", "invalid_response", "wrong_pid", "already_requested", "disabled") and requests != 1:
+            raise ValueError()
+        if handshakes and (type(config.get("elapsed_seconds")) not in (int, float)
+                           or not math.isfinite(config["elapsed_seconds"]) or config["elapsed_seconds"] < config["at_seconds"]):
+            raise ValueError()
+        if status in ("captured", "no_png", "invalid_png") and requests != 1:
+            raise ValueError()
+        if status == "no_pid" and (handshakes != 1 or requests):
+            raise ValueError()
+        if requests:
+            response = config.get("arm_response", {})
+            if response.get("status") not in ("armed", "wrong_pid", "already_requested", "disabled", "identity_mismatch", "unavailable", "timeout", "invalid_response"):
+                raise ValueError()
+            if response["status"] == "armed":
+                if response.get("pid") != pid or status not in ("captured", "no_png", "early_exit", "invalid_png"):
+                    raise ValueError()
+            elif response["status"] != status:
+                raise ValueError()
+        hashes = config.get("source_hashes", {})
+        if set(hashes) != set(PRESENT_SOURCES) or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v) for v in hashes.values()):
+            raise ValueError()
+        run_id = result["run_id"]
+        if not isinstance(run_id, str) or run_id in ("", ".", "..") or os.path.basename(run_id) != run_id:
+            raise ValueError()
+        run_dir = os.path.join(REPO, "runs", run_id)
+        artifact = rel(os.path.join(run_dir, "present_snapshot.png"))
+        environment = {"VXRT_PRESENT_SNAPSHOT_CONTROL": "1", "VXRT_PRESENT_SNAPSHOT": os.path.join(run_dir, "present_snapshot.png")}
+        if config.get("environment") != environment:
+            raise ValueError()
+        record = [o for o in observations if o["metric"] == "present_snapshot"]
+        png = [o for o in observations if o["metric"] == "present_snapshot_png"]
+        if len(record) != 1 or record[0]["value"] != config or record[0].get("artifact") != rel(os.path.join(run_dir, "present_snapshot.json")):
+            raise ValueError()
+        with open(os.path.join(run_dir, "present_snapshot.json")) as source:
+            if json.load(source) != config:
+                raise ValueError()
+        if status == "captured":
+            metadata = present_png_metadata(run_dir)
+            if (config.get("artifact") != artifact or config.get("png") != metadata or len(png) != 1
+                or png[0].get("artifact") != artifact or png[0].get("sha256") != metadata["sha256"] or png[0]["value"] != metadata):
+                raise ValueError()
+        elif png or "png" in config or "artifact" in config:
+            raise ValueError()
+        elif status == "no_png" and os.path.lexists(os.path.join(run_dir, "present_snapshot.png")):
+            raise ValueError()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        problems.append("present_snapshot: invalid configuration, counts, PID, status, header or artifact hash")
+    return problems
+
+
+def archive_compositor(overlay, logs, evidence):
+    source = os.path.join(overlay, "logs", "vrcompositor.txt")
+    destination = os.path.join(logs, "vrcompositor.txt")
+    if not os.path.isfile(source):
+        evidence.observe("vrcompositor_log_archive", {"status": "unavailable"}, note="raw overlay log; may include historical sessions; not per-run Submit evidence")
+        return
+    with open(source, "rb") as incoming, open(destination, "xb") as output:
+        shutil.copyfileobj(incoming, output)
+    evidence.observe("vrcompositor_log_archive", {"status": "archived", "source": source}, destination,
+                     note="raw overlay log; may include historical sessions; not per-run Submit evidence")
+
+
 class WindowMetadata:
     schedule = (30, 40, 50)
 
@@ -666,7 +883,7 @@ class WindowMetadata:
         except OSError:
             pass
 
-    def sample(self, wait=False):
+    def sample(self, wait=False, snapshot_pid=None):
         # Never persist arbitrary server fields, even when a stale/malicious endpoint replies.
         counts = ("total_windows", "visible_windows", "enabled_windows", "child_windows", "minimized_windows")
         deadline = time.monotonic() + 2
@@ -683,7 +900,8 @@ class WindowMetadata:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(max(.001, deadline - time.monotonic()))
                 client.connect(self.path)
-                client.sendall(b"wait_snapshot\n" if wait else b"metadata\n")
+                client.sendall((f"present_snapshot {snapshot_pid}\n".encode("ascii") if snapshot_pid is not None else
+                                b"wait_snapshot\n" if wait else b"metadata\n"))
                 limit = 131072 if wait else 4096
                 data = b""
                 while b"\n" not in data:
@@ -696,6 +914,14 @@ class WindowMetadata:
                         return {"status": "invalid_response"}
                     data += chunk
                 value = json.loads(data.split(b"\n", 1)[0])
+                if snapshot_pid is not None:
+                    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 1
+                        or value.get("status") not in ("armed", "wrong_pid", "already_requested", "disabled")
+                        or type(value.get("pid")) is not int or value["pid"] <= 0):
+                        return {"status": "invalid_response"}
+                    if value["pid"] != snapshot_pid:
+                        return {"status": "wrong_pid", "pid": value["pid"]}
+                    return {"status": value["status"], "pid": value["pid"]}
                 if (not isinstance(value, dict) or value.get("status") != "ok" or type(value.get("schema_version")) is not int or value["schema_version"] != 1
                     or type(value.get("pid")) is not int or value["pid"] <= 0
                     or (not wait and self.window_enabled and any(type(value.get(k)) is not int or not 0 <= value[k] <= 16384 for k in counts))):
@@ -718,13 +944,20 @@ class WindowMetadata:
             return {"status": "unavailable"}
 
     def collect(self, stop, started):
-        for index, offset in enumerate(self.schedule, 1):
+        events = [(offset, index) for index, offset in enumerate(self.schedule, 1)
+                  if self.window_enabled or self.render_enabled or self.wait_enabled]
+        if getattr(self, "present", None) and self.present.enabled:
+            events.append((self.present.config["at_seconds"], 0))
+        for offset, index in sorted(events):
             while time.monotonic() < started + offset and not stop.is_set():
                 self.remember_socket()  # identity only; no extra state requests
                 stop.wait(min(.1, max(0, started + offset - time.monotonic())))
             self.remember_socket()
             if stop.is_set():
                 break
+            if index == 0:
+                self.present.arm(self, time.monotonic() - started)
+                continue
             if self.wait_enabled:
                 wait_row = self.sample(wait=True)
                 wait_row.update(sample_index=index, elapsed_seconds=round(time.monotonic() - started, 3))
@@ -782,7 +1015,7 @@ class WindowMetadata:
                                            for source in WAIT_SOURCES}
 
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
-        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False, cpu_diagnostic=False, wait_diagnostic=False, diagnostic_delay=0):
+        trace=False, need_steam=True, quiet=False, settings=None, stream=False, safety_env=None, network_diagnostic=False, window_metadata=False, render_diagnostic=False, cpu_diagnostic=False, wait_diagnostic=False, diagnostic_delay=0, present_snapshot_at=None):
     windows = WindowMetadata(window_metadata, render_diagnostic, cpu_diagnostic, wait_diagnostic, diagnostic_delay)
     if wait_diagnostic and "VXRT_TRACE_CALLS" in os.environ:
         raise ValueError("wait_diagnostic conflicts with VXRT_TRACE_CALLS")
@@ -796,6 +1029,9 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         press_every = 0
     args = list((sc or {}).get("args", [])) + list(extra_args)
     seconds = seconds or (sc or {}).get("seconds", 150)
+    present = PresentSnapshot(present_snapshot_at, seconds)
+    windows.present = present
+    windows.enabled = windows.enabled or present.enabled
     root = root or os.path.join(HARNESS, "root")
     overlay = overlay or os.path.join(HARNESS, "overlay")
     started = time.time()
@@ -819,6 +1055,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     result["render_diagnostic"] = windows.render_config
     result["cpu_diagnostic"] = windows.cpu.config
     result["wait_diagnostic"] = windows.wait_config
+    result["present_snapshot"] = present.config
     result["input_mode"] = input_mode
     result["safety_environment"] = dict({"VXRT_MUTE": "1", "VERANTYX_AUDIO": "0"}, **safety_env)
     checks = preconditions(spec, inst, args, root, overlay, need_steam)
@@ -859,6 +1096,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         exe = os.path.basename(inst["exe"]); game_log = os.path.join(logs, "vxrt-%s.log" % os.path.splitext(exe)[0])
     result["command"] = " ".join(cmd)
     result["exe"] = exe
+    present.prepare(env, run_dir)
     windows.prepare(env, inst["exe"])
     shared = os.path.join(root, "drive_c", "vr_shared_frame.dat")
     stop, gpu, streamed = threading.Event(), [], []
@@ -965,6 +1203,9 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     ev.observe("native_metal_assertion", facts["native_metal_assertion"], game_log,
                note="first recognized native Metal assertion header; helper-prefixed lines excluded; unprefixed stderr has no process identity; null does not prove absence of a native abort")
 
+    present.seal(run_dir, ev, exited_at is not None)
+    archive_compositor(overlay, logs, ev)
+
     base_name, base, base_src = baseline_for(key, scenario, quality)
     result["baseline"] = base_src
     derive(ev, base_name, base, base_src)
@@ -1028,6 +1269,7 @@ def main():
     ap.add_argument("--diagnostic-delay", type=float, default=0, help="delay the three diagnostic snapshots by 0..3600 seconds (default 0)")
     ap.add_argument("--wait-diagnostic", action="store_true", help="three bounded wait snapshots in the selected main process; no text payloads")
     ap.add_argument("--render-diagnostic", action="store_true", help="three fixed D3D11/DXGI counter snapshots in the selected main process; no textures or OpenVR hooks")
+    ap.add_argument("--present-snapshot-at", type=float, help="opt in to one main-process window PNG at 30..3600 seconds, before --seconds; user inspection only")
     ap.add_argument("--window-metadata", action="store_true", help="three read-only window metadata samples; no text or input")
     ap.add_argument("--network-diagnostic", action="store_true", help="fixed network API diagnostic: returns/errors and caller offsets, at most 128 records per process, no argument payloads")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="a tunable setting (AGENTS.md), repeatable")
@@ -1061,7 +1303,7 @@ def main():
                 scenario, _, quality = name.partition("@")
                 r = run(key, scenario, quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam,
                         settings=dict(kv.split("=", 1) for kv in a.set), safety_env=dict(kv.split("=", 1) for kv in a.safety_env),
-                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic, diagnostic_delay=a.diagnostic_delay)
+                        network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic, diagnostic_delay=a.diagnostic_delay, present_snapshot_at=a.present_snapshot_at)
                 code = {"pass": 0, "fail": 1, "no_baseline": 2, "refused": 3}.get(r["status"], 4)
                 if code == 3: sys.exit(3)                      # (refused: the rest would be too)
                 worst = max(worst, code)
@@ -1076,7 +1318,7 @@ def main():
     try:
         r = run(a.game, a.scenario, a.quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam, quiet=a.json,
                 settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream,
-                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic, diagnostic_delay=a.diagnostic_delay)
+                safety_env=dict(kv.split("=", 1) for kv in a.safety_env), network_diagnostic=a.network_diagnostic, window_metadata=a.window_metadata, render_diagnostic=a.render_diagnostic, cpu_diagnostic=a.cpu_diagnostic, wait_diagnostic=a.wait_diagnostic, diagnostic_delay=a.diagnostic_delay, present_snapshot_at=a.present_snapshot_at)
     except Exception as e:                                    # (an error in the harness itself, not a game's)
         print(f"vxrt run: error: {e}", file=sys.stderr); sys.exit(4)
     if a.json:

@@ -157,6 +157,8 @@ void   vx_set_event(HANDLE event);          // SetEvent for threads that are not
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);
 void vx_control_metadata_start(const char *exe);
+void vx_present_snapshot_enable(void);
+const char *vx_present_snapshot_arm(uint64_t pid);
 void vx_control_start(const char *path);       // control.c: VXRT_CONTROL, the socket Command Clips talk to
 extern int vx_trace;
 

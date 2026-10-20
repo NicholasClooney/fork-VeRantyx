@@ -362,6 +362,8 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	python3 ../tools/test_vxrt_network_diagnostic.py
 	python3 ../tools/test_vxrt_stream_metrics.py
 	python3 ../tools/test_vxrt_metal_abort.py
+	python3 ../tools/test_vxrt_present_snapshot.py
+	$(MAKE) present-snapshot-check
 	$(MAKE) cpu-diagnostic-check
 	$(MAKE) wait-diagnostic-check
 	$(MAKE) atomic-texture-check
@@ -585,3 +587,11 @@ build/half_conversion: tests/half_conversion.m src/dxbc.c src/dxbc.h
 
 half-conversion-check: build/half_conversion
 	MTL_DEBUG_LAYER=1 build/half_conversion
+
+.PHONY: present-snapshot-check
+build/present_snapshot_guest.exe: tests/present_snapshot_guest.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luser32
+
+present-snapshot-check: build/present_snapshot_guest.exe build/vxrt
+	python3 tests/present_snapshot_check.py
