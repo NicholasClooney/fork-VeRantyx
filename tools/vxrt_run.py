@@ -597,6 +597,51 @@ PRESENT_MAX_BYTES = 256 * 1024 * 1024
 PRESENT_NOTE = "Window Present snapshot for the user to inspect first; agents must not view, describe, OCR or analyze pixels. Not stream-frame or Submit evidence. A missing PNG does not establish that no Present occurred; unsupported formats, encoding or file-write failures can also leave no PNG."
 PRESENT_FAILURES = ("not_started", "early_exit", "stopped", "no_pid", "identity_mismatch", "unavailable", "timeout",
                     "invalid_response", "wrong_pid", "already_requested", "disabled", "no_png", "invalid_png")
+PRESENT_STAGES = ("claimed", "readback", "encode", "write", "done")
+PRESENT_CATEGORIES = ("none", "ok", "missing_texture", "invalid_dimensions", "unsupported_format",
+                      "allocation", "gpu", "encode", "invalid_path", "path_open", "file_create",
+                      "file_write", "file_sync", "file_close")
+
+
+def present_snapshot_trace(path, pid):
+    """Fixed runtime metadata only. Missing records do not prove that Present stopped."""
+    result = {"status": "no_pid", "pid": pid, "records": []}
+    if type(pid) is not int or pid <= 0:
+        return result
+    result["status"] = "unavailable"
+    try:
+        source = open(path)
+    except OSError:
+        return result
+    pattern = re.compile(r"\[vxrt\] (?:\d{2}:\d{2}:\d{2}\.\d{3} )?"
+                         r"present_snapshot: pid=(\d{1,10}) stage=([a-z_]+) format=(\d{1,10}) "
+                         r"width=(\d{1,10}) height=(\d{1,10}) category=([a-z_]+)")
+    result["status"] = "not_recorded"
+    previous = -1
+    identity = None
+    with source:
+        for number, line in enumerate(source, 1):
+            match = pattern.fullmatch(line.rstrip("\r\n")) if len(line) < 1024 else None
+            if not match or int(match[1]) != pid:
+                continue
+            stage, category = match[2], match[6]
+            dimensions = tuple(int(match[i]) for i in (3, 4, 5))
+            if (stage not in PRESENT_STAGES or category not in PRESENT_CATEGORIES
+                or any(n > 0xffffffff for n in dimensions)):
+                result["status"] = "invalid"
+                break
+            index = PRESENT_STAGES.index(stage)
+            if (index <= previous or (previous == -1 and stage != "claimed")
+                or (stage != "done" and (index != previous + 1 or category != "none"))
+                or (stage == "done" and (category == "none" or (category == "ok" and previous != 3)))
+                or (identity is not None and dimensions != identity)):
+                result["status"] = "invalid"
+                break
+            identity, previous = dimensions, index
+            result["records"].append({"line": number, "stage": stage, "category": category,
+                                      "format": dimensions[0], "width": dimensions[1], "height": dimensions[2]})
+            result["status"] = "recorded"
+    return result
 
 
 def present_png_metadata(run_dir):
@@ -709,7 +754,8 @@ class PresentSnapshot:
 
 def validate_present_snapshot(result):
     config = result.get("present_snapshot")
-    observations = [o for o in result.get("observed", []) if o.get("metric") in ("present_snapshot", "present_snapshot_png")]
+    observations = [o for o in result.get("observed", []) if o.get("metric") in
+                    ("present_snapshot", "present_snapshot_png", "present_snapshot_trace")]
     if config is None:
         return ["present_snapshot: missing configuration"] if observations else []
     problems = []
@@ -789,6 +835,19 @@ def validate_present_snapshot(result):
             raise ValueError()
         elif status == "no_png" and os.path.lexists(os.path.join(run_dir, "present_snapshot.png")):
             raise ValueError()
+        traces = [o for o in result.get("observed", []) if o.get("metric") == "present_snapshot_trace"]
+        if len(traces) > 1:
+            raise ValueError()
+        for trace in traces:
+            if not trace.get("artifact"):
+                missing = {"status": "no_pid" if pid is None else "unavailable", "pid": pid, "records": []}
+                if trace["value"] != missing or trace.get("sha256"):
+                    raise ValueError()
+                continue
+            log = os.path.join(REPO, trace["artifact"])
+            if (os.path.dirname(os.path.realpath(log)) != os.path.join(run_dir, "logs")
+                or trace["value"] != present_snapshot_trace(log, pid)):
+                raise ValueError()
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         problems.append("present_snapshot: invalid configuration, counts, PID, status, header or artifact hash")
     return problems
@@ -1205,6 +1264,9 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
 
     present.seal(run_dir, ev, exited_at is not None)
     archive_compositor(overlay, logs, ev)
+    if present.enabled:
+        ev.observe("present_snapshot_trace", present_snapshot_trace(game_log, present.config["pid"]), game_log,
+                   note="fixed stages for the armed main PID only; no pixels or paths in records. Missing/incomplete records do not prove no Present; capture can stall or fail. Not Submit evidence.")
 
     base_name, base, base_src = baseline_for(key, scenario, quality)
     result["baseline"] = base_src

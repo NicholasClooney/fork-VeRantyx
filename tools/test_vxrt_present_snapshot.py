@@ -345,5 +345,74 @@ class Snapshot(unittest.TestCase):
         self.assertEqual(evidence.observed[-1]['sha256'], h.hashlib.sha256(raw).hexdigest())
 
 
+    def test_trace_sealing_validation_and_tampering(self):
+        snapshot, evidence, result = self.sealed(image=False)
+        logs = Path(self.run_dir, "logs")
+        logs.mkdir()
+        log = logs / "vxrt-synthetic.log"
+        log.write_text(CaptureTrace.line("claimed") + CaptureTrace.line("done", "unsupported_format"))
+        evidence.observe("present_snapshot_trace", h.present_snapshot_trace(str(log), 431), str(log))
+        self.assertEqual(h.validate_present_snapshot(result), [])
+        result["observed"][-1]["value"]["records"][-1]["category"] = "ok"
+        self.assertTrue(h.validate_present_snapshot(result))
+        result["observed"][-1]["value"] = {"status": "unavailable", "pid": 431, "records": []}
+        result["observed"][-1].pop("artifact")
+        result["observed"][-1].pop("sha256")
+        self.assertEqual(h.validate_present_snapshot(result), [])
+        del result["present_snapshot"]
+        self.assertTrue(h.validate_present_snapshot(result))
+
+
+class CaptureTrace(unittest.TestCase):
+    @staticmethod
+    def line(stage, category="none", pid=431, width=64):
+        return (f"[vxrt] 10:20:30.000 present_snapshot: pid={pid} stage={stage} "
+                f"format=70 width={width} height=48 category={category}\n")
+
+    def parse(self, text, pid=431):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "synthetic.log")
+            path.write_text(text)
+            return h.present_snapshot_trace(str(path), pid)
+
+    def test_complete_fixed_metadata(self):
+        text = "".join(self.line(stage, "ok" if stage == "done" else "none") for stage in h.PRESENT_STAGES)
+        result = self.parse(text)
+        self.assertEqual(result["status"], "recorded")
+        self.assertEqual(len(result["records"]), 5)
+        self.assertEqual(result["records"][-1], {
+            "line": 5, "stage": "done", "category": "ok", "format": 70, "width": 64, "height": 48})
+
+    def test_fixed_failures_and_incomplete_trace(self):
+        for category in h.PRESENT_CATEGORIES[2:]:
+            with self.subTest(category=category):
+                result = self.parse(self.line("claimed") + self.line("done", category))
+                self.assertEqual(result["status"], "recorded")
+                self.assertEqual(result["records"][-1]["category"], category)
+        result = self.parse(self.line("claimed") + self.line("readback"))
+        self.assertEqual(result["status"], "recorded")
+        self.assertEqual(result["records"][-1]["stage"], "readback")
+        self.assertEqual(self.parse("")["status"], "not_recorded")
+        self.assertEqual(self.parse("", None)["status"], "no_pid")
+        self.assertEqual(h.present_snapshot_trace("/nonexistent/synthetic.log", 431)["status"], "unavailable")
+
+    def test_helpers_other_pids_and_payload_noise_excluded(self):
+        text = (self.line("claimed", pid=432)
+                + self.line("claimed").replace("[vxrt]", "[vxrt helper.exe:431]")
+                + self.line("claimed").replace("[vxrt] ", "")
+                + self.line("claimed").rstrip() + " arbitrary payload\n")
+        self.assertEqual(self.parse(text), {"status": "not_recorded", "pid": 431, "records": []})
+
+    def test_invalid_sequence_dimensions_and_categories(self):
+        for text in (self.line("write"), self.line("claimed") * 6,
+                     self.line("claimed") + self.line("done", "ok"),
+                     self.line("claimed") + self.line("readback", width=65),
+                     self.line("claimed", "ok"), self.line("unknown"),
+                     self.line("claimed") + self.line("done", "arbitrary"),
+                     self.line("claimed", width=4294967296)):
+            with self.subTest(text=text):
+                self.assertEqual(self.parse(text)["status"], "invalid")
+
+
 if __name__ == '__main__':
     unittest.main()

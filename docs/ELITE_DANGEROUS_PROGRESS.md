@@ -553,3 +553,32 @@ checks and all 10 synthetic runtime cases; no D3D12 timestamp exception was need
 schema validation passed (five profiles, zero problems). Cross-game VR checks remain not checked: those games
 are not installed. The next authorized run adds `--present-snapshot-at 150` to the existing 180-second diagnostic
 command; only the user inspects its new PNG. Snapshot overhead is not an ABBA performance measurement.
+
+### Armed snapshot without an artifact: 101805Z
+
+`20261020T101805Z-elite-keyboard-diagnostic` records one successful PID82395 handshake and arm at150.003s,
+but no PNG at sealing (`o24`, `no_png`). Nobody inspected a game-window image because none was produced. This
+run's completed Presents are144/260/336 at110/120/130s (`o21`), not the preceding run's3014/3612/4209. These
+samples precede the arm and cannot establish subsequent Present activity. `o2=21.0`, `o14=0`, `o18=null` and
+`o23=null` do not identify a capture failure; `o1=false`/`d4=true` still track the launcher. The raw compositor log
+is now sealed (`o25`), without an inferred Submit claim.
+
+The current output path is canonical, its ancestors are not symlinks, and the run directory has the expected
+owner. Synthetic capture to a repository `runs/` path succeeds; unsupported-format and existing-file cases also
+behave as expected. This does not prove the game's runtime permissions, format, GPU state or write outcome.
+The original controlled capture discarded its return status, so missing output could not distinguish a request
+never claimed from readback, encoding or file-write failure. No particular game-capture defect has been reproduced.
+
+Controlled capture now reports at most five fixed metadata lines: claimed/readback/encode/write/done, with PID,
+Metal format, dimensions and an allowlisted result category. It records no pixels, paths or arbitrary error text.
+The harness seals a strict PID-filtered projection as an appended observation, checks ordering and metadata
+consistency, and preserves incomplete/missing records as uncertainty. Capture semantics, one-shot limits and
+user-first image restrictions remain unchanged. The next diagnostic uses `--diagnostic-delay 120` (150/160/170s)
+with `--present-snapshot-at 150`, so there are activity snapshots after the arm. Neither these diagnostics nor
+window capture directly observe IVRCompositor::Submit.
+
+Validation: all 23 synthetic harness tests and all 11 synthetic runtime cases pass; full `make -C VXRuntime check`
+passes without the timestamp waiver on this attempt. The original 101805Z result validates unchanged. Profile
+schema check reports five valid profiles. GPU/allocation/write/fsync/close failures were not fault-injected;
+their categories are code paths, not measured game findings. No game capture fix or successful new capture is
+claimed before the next harness run. Other-game VR checks remain not checked: not installed.

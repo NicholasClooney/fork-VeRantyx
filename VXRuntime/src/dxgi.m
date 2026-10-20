@@ -359,22 +359,41 @@ static WINAPI HRESULT swapchain_get_buffer(void *this, uint32_t index, const GUI
     return call_qi(sc->buffer, iid, out);
 }
 // A texture's first level as a PNG (8-bit RGBA/BGRA textures), for VXRT_PRESENT_SNAPSHOT and VXRT_SHARED_SNAPSHOT.
+typedef struct {
+    NSUInteger format, width, height;
+    const char *category;
+} snapshot_diag;
+static void snapshot_stage(snapshot_diag *diag, const char *stage) {
+    if (diag) vx_log("present_snapshot: pid=%d stage=%s format=%lu width=%lu height=%lu category=%s",
+        getpid(), stage, (unsigned long)diag->format, (unsigned long)diag->width,
+        (unsigned long)diag->height, !strcmp(stage, "done") ? diag->category : "none");
+}
+static int snapshot_failure(snapshot_diag *diag, const char *category) {
+    if (diag) diag->category = category;
+    return 0;
+}
 // Walk every directory through an fd: neither parents nor the final name may be symlinks.
-static int snapshot_write(const char *path, CFDataRef data) {
-    if (!path || path[0] != '/') return 0;
+static int snapshot_write(const char *path, CFDataRef data, snapshot_diag *diag) {
+    if (!path || path[0] != '/') return snapshot_failure(diag, "invalid_path");
     char *copy = strdup(path + 1);
-    if (!copy) return 0;
+    if (!copy) return snapshot_failure(diag, "allocation");
     int dir = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC), fd = -1, ok = 0;
+    snapshot_failure(diag, "path_open");
     char *name = copy, *slash;
     while (dir >= 0 && (slash = strchr(name, '/'))) {
         *slash = 0;
-        if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) goto done;
+        if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) {
+            snapshot_failure(diag, "invalid_path"); goto done;
+        }
         int next = openat(dir, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         close(dir); dir = next; name = slash + 1;
     }
-    if (dir < 0 || !*name || !strcmp(name, ".") || !strcmp(name, "..")) goto done;
+    if (dir < 0) goto done;
+    if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) {
+        snapshot_failure(diag, "invalid_path"); goto done;
+    }
     fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) goto done;
+    if (fd < 0) { snapshot_failure(diag, "file_create"); goto done; }
     CFIndex size = CFDataGetLength(data), offset = 0;
     while (offset < size) {
         ssize_t n = write(fd, CFDataGetBytePtr(data) + offset, (size_t)(size - offset));
@@ -382,8 +401,10 @@ static int snapshot_write(const char *path, CFDataRef data) {
         if (n <= 0) break;
         offset += n;
     }
-    ok = offset == size && fsync(fd) == 0;
-    if (close(fd)) ok = 0;
+    ok = offset == size;
+    if (!ok) snapshot_failure(diag, "file_write");
+    if (ok && fsync(fd)) { ok = 0; snapshot_failure(diag, "file_sync"); }
+    if (close(fd)) { ok = 0; snapshot_failure(diag, "file_close"); }
     fd = -1;
     if (!ok) unlinkat(dir, name, 0);
 done:
@@ -392,23 +413,27 @@ done:
     free(copy);
     return ok;
 }
-static int texture_png(d3d_device *dev, void *texture, const char *path, int exclusive) {
+static int texture_png(d3d_device *dev, void *texture, const char *path, int exclusive, snapshot_diag *diag) {
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
+    snapshot_stage(diag, "readback");
+    if (!tex) return snapshot_failure(diag, "missing_texture");
     MTLPixelFormat f = tex.pixelFormat;
     int bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
-    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) return 0;
+    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB)
+        return snapshot_failure(diag, "unsupported_format");
     NSUInteger w = tex.width, h = tex.height, row = w * 4;
-    if (!w || !h || w > SIZE_MAX / 4 || h > SIZE_MAX / row) return 0;
+    if (!w || !h || w > SIZE_MAX / 4 || h > SIZE_MAX / row) return snapshot_failure(diag, "invalid_dimensions");
     id<MTLBuffer> buf = [tex.device newBufferWithLength:row * h options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-    if (!buf || !cmd || !blit) { [blit endEncoding]; return 0; }
+    if (!buf || !cmd || !blit) { [blit endEncoding]; return snapshot_failure(diag, "allocation"); }
     [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
                  toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
     [blit endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted || !buf.contents) return 0;
+    if (cmd.status != MTLCommandBufferStatusCompleted || !buf.contents) return snapshot_failure(diag, "gpu");
+    snapshot_stage(diag, "encode");
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGBitmapInfo info = bgra ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : (kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast);
     CGContextRef ctx = cs ? CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, info) : NULL;
@@ -416,10 +441,12 @@ static int texture_png(d3d_device *dev, void *texture, const char *path, int exc
     CFMutableDataRef data = CFDataCreateMutable(NULL, 0);
     CGImageDestinationRef dst = img && data ? CGImageDestinationCreateWithData(data, CFSTR("public.png"), 1, NULL) : NULL;
     int ok = 0;
+    snapshot_failure(diag, "encode");
     if (dst) {
         CGImageDestinationAddImage(dst, img, NULL);
         if (CGImageDestinationFinalize(dst)) {
-            if (exclusive) ok = snapshot_write(path, data);
+            snapshot_stage(diag, "write");
+            if (exclusive) ok = snapshot_write(path, data, diag);
             else ok = [(__bridge NSData *)data writeToFile:[NSString stringWithUTF8String:path] atomically:YES];
         }
         CFRelease(dst);
@@ -431,7 +458,7 @@ static int texture_png(d3d_device *dev, void *texture, const char *path, int exc
     return ok;
 }
 void d3d_texture_png(d3d_device *dev, void *texture, const char *path) {
-    if (texture_png(dev, texture, path, 0)) vx_log("snapshot: PNG written to %s", path);
+    if (texture_png(dev, texture, path, 0, NULL)) vx_log("snapshot: PNG written to %s", path);
 }
 static int g_snapshot_state; // 0 disabled, 1 available, 2 armed, 3 claimed (including failed captures)
 void vx_present_snapshot_enable(void) {
@@ -456,22 +483,32 @@ static void snapshot(swapchain *sc) {
     if (bounded) {
         int expected = 2;
         if (!__atomic_compare_exchange_n(&g_snapshot_state, &expected, 3, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
-        if (!path || getenv("VXRT_CHILD")) return;
     } else if (!path || sc->presents + 1 != (uint64_t)(at ? atoll(at) : 300)) return;
     int saved_errno = errno;
     DWORD saved_error = vx_get_last_error();
     id<MTLTexture> back = (__bridge id<MTLTexture>)sc->buffer->mtl;
+    snapshot_diag diag = { back.pixelFormat, back.width, back.height, "ok" };
+    snapshot_diag *report = bounded ? &diag : NULL;
+    snapshot_stage(report, "claimed");
+    if (bounded && (!path || getenv("VXRT_CHILD"))) {
+        snapshot_failure(report, "invalid_path");
+        goto done;
+    }
     if (back.sampleCount > 1) {                     // multisampled: the resolved picture
         id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
         back = resolve_back_buffer(sc, cmd, back);
         [cmd commit];
         [cmd waitUntilCompleted];
         if (bounded && (!back || cmd.status != MTLCommandBufferStatusCompleted)) {
-            vx_set_last_error(saved_error); errno = saved_errno; return;
+            snapshot_failure(report, "gpu"); goto done;
         }
     }
-    if (bounded) texture_png(sc->dev, (__bridge void *)back, path, 1);
+    if (bounded) {
+        if (texture_png(sc->dev, (__bridge void *)back, path, 1, report)) diag.category = "ok";
+    }
     else d3d_texture_png(sc->dev, (__bridge void *)back, path);
+done:
+    snapshot_stage(report, "done");
     vx_set_last_error(saved_error);
     errno = saved_errno;
 }
